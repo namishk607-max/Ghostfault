@@ -1,0 +1,7 @@
+incident_id,machine_id,date,symptom,maintenance_action,outcome
+INC-2024-001,M-104,2024-01-12,High bearing temperature and abnormal acoustic pitch,Lubricated drive-end roller bearing and retorqued housing bolts,Resolved - Bearing temperature stabilized within nominal 65C operating limit
+INC-2024-002,M-104,2024-02-04,Recurrent harmonic vibration under peak load,Replaced degraded elastomer coupling insert and re-aligned shaft,Resolved - Vibration velocity decreased from 7.2 mm/s to 1.4 mm/s
+INC-2024-003,M-104,2024-03-18,Intermittent pressure drop across primary hydraulic circuit,Replaced clogged 10-micron hydraulic return filter cartridge and bled air,Resolved - System line pressure restored to stable 210 bar
+INC-2024-004,M-205,2024-01-28,Spindle positioning drift and optical encoder feedback error,Cleaned linear glass scale with isopropyl alcohol and recalibrated zero datum,Resolved - Positioning repeatability verified within +/- 2 microns
+INC-2024-005,M-205,2024-03-02,Spindle drive thermal trip during high-torque milling cycles,Flushed closed-loop glycol chiller circuit and replenished heat transfer fluid,Resolved - Coolant loop supply temp dropped by 8C; no subsequent thermal trips
+INC-2024-006,M-310,2024-02-19,Pneumatic actuator delayed stroke extension,Inspected proportional solenoid valve and replaced worn rod wiper seal,Resolved - Cycle stroke time restored to standard 420 ms

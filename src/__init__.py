@@ -1,0 +1,1 @@
+"""GhostFault core module."""
