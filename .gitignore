@@ -22,6 +22,9 @@ htmlcov/
 *.local
 secrets/
 
+# Runtime evidence and ingested documents (preserve data/sample)
+data/evidence/
+
 # IDE / Editor artifacts
 .vscode/
 .idea/
