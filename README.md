@@ -20,49 +20,50 @@ Ghostvault/
 │   └── evidence/            # [Runtime / Local only - Git ignored]
 │       ├── originals/       # Safe storage of raw uploaded files (<doc_id>_<safe_name>)
 │       ├── extracted/       # Extracted plain text UTF-8 files (<doc_id>.txt)
-│       └── metadata/
-│           └── catalog.json # Structured document catalog and ingestion metadata
+│       ├── metadata/
+│       │   └── catalog.json # Structured document catalog and ingestion metadata
+│       └── index/
+│           └── evidence_index.db # SQLite FTS5 persistent full-text search index
 ├── src/
 │   ├── __init__.py
 │   ├── data_loader.py       # Incident dataset validation, relative loading, and filtering
-│   ├── models.py            # Ingestion contracts, DocumentMetadata, DocumentStatus, ErrorCode
+│   ├── models.py            # Ingestion & retrieval models (DocumentMetadata, EvidenceChunk, SearchResult)
 │   ├── extractor.py         # Isolated text extraction for TXT and PDF (pypdf)
 │   ├── storage.py           # Atomic writes, path traversal sanitization, and catalog management
-│   └── ingestion.py         # Ingestion orchestration and pre-validation pipeline
+│   ├── ingestion.py         # Ingestion orchestration and pre-validation pipeline
+│   ├── chunker.py           # Deterministic text chunker with natural boundaries & offsets
+│   ├── indexer.py           # Persistent SQLite FTS5 index manager with change tracking
+│   └── retriever.py         # Deterministic keyword retrieval with BM25 ranking & snippet highlights
 └── tests/
     ├── test_incidents.py    # Unit tests for incident dataset integrity and filtering
-    └── test_ingestion.py    # Unit tests for document ingestion, validation, and extraction
+    ├── test_ingestion.py    # Unit tests for document ingestion, validation, and extraction
+    └── test_retrieval.py    # Unit tests for chunking, FTS5 indexing, and BM25 retrieval
 ```
 
 ---
 
-## Milestone 2: Evidence Ingestion & Document Management
+## Milestone 3: Evidence Chunking, Indexing & Retrieval
 
-Milestone 2 delivers a reliable local document ingestion foundation without introducing external AI APIs, vector databases, or cloud services:
+Milestone 3 delivers a reliable, deterministic local evidence retrieval engine:
 
-- **Supported Document Formats:** Selectable text `.pdf` and plain-text `.txt` files (UTF-8, Latin-1, UTF-16).
-- **Document Identity:** Collision-resistant UUID `DOC-XXXXXXXXXXXX` generated per upload. Duplicate filenames are safe and will not overwrite previous uploads.
-- **Path Traversal Protection:** Filenames are sanitized, stripped of directory separators and parent traversals (`..`), and confined strictly to the configured evidence root.
-- **Atomic Persistence:** Catalog updates and file writes use temporary files replaced atomically to prevent corruption.
-- **Explicit Failure Detection:** Empty files, corrupt PDFs, unsupported file types, and PDFs without selectable text are flagged with clear error codes (`ERR_EMPTY_FILE`, `ERR_INVALID_PDF`, `ERR_NO_EXTRACTABLE_TEXT`, `ERR_UNSUPPORTED_TYPE`).
-- **Scanned PDF Notice:** Scanned PDFs (raster images without an OCR text layer) will be flagged as containing no extractable text. OCR is not implemented in Milestone 2.
+### 1. Chunking Policy & Configuration Defaults
+- **Chunk Size:** 600 characters (`DEFAULT_CHUNK_SIZE`), bounded between 100 and 4,000 characters.
+- **Overlap:** 100 characters (`DEFAULT_CHUNK_OVERLAP`) to avoid losing context across boundaries.
+- **Natural Boundary Detection:** Prefers paragraph boundaries (`\n\n`), then sentence endings (`. `, `! `, `? `), then newlines (`\n`), and spaces before falling back to fixed cuts.
+- **Provenance:** Every chunk retains `document_id`, `source_filename`, `file_type`, character `start_offset`, `end_offset`, `content_hash`, and a collision-resistant deterministic `chunk_id` (`<doc_id>_CHK<index>_<hash>`).
+- **Page Numbers:** Explicitly labeled as *Unavailable* when documents have been stored as flattened extracted text, avoiding fabricated page provenance.
 
-### Ingestion Contract & Metadata Schema
+### 2. Search Index & Storage
+- **Backend:** Embedded **SQLite FTS5** virtual table (`chunks_fts`) using Porter stemming and unicode61 tokenizer.
+- **Persistence Location:** `data/evidence/index/evidence_index.db` (100% local, excluded from Git).
+- **Change Detection & Transactions:** Documents are fingerprinted via SHA-256. Re-indexing identical documents is a no-op; updating document text replaces stale chunks atomically within a database transaction.
+- **Lifecycle Operations:** Supports automatic indexing upon successful ingestion, manual on-demand `Sync Index`, and a full zero-loss `Rebuild Index`.
 
-Every ingested document maintains the following metadata in `catalog.json`:
-- `document_id`: Unique identifier (e.g., `DOC-A1B2C3D4E5F6`).
-- `original_filename`: Original filename preserved for display.
-- `file_type`: Detected extension type (`pdf` or `txt`).
-- `source_type`: Origin (e.g., `dashboard_upload`, `manual_upload`).
-- `storage_reference`: Path to original file relative to storage root.
-- `extraction_status`: Extraction outcome (`success` or `failed`).
-- `ingestion_status`: Ingestion lifecycle state (`uploaded`, `validating`, `processing`, `processed`, `failed`).
-- `created_at`: UTC ISO 8601 creation timestamp.
-- `updated_at`: UTC ISO 8601 last update timestamp.
-- `extracted_text_reference`: Path to saved `.txt` file relative to storage root.
-- `extracted_character_count`: Count of extracted text characters.
-- `error_code`: Standardized error code if failed (or `null`).
-- `error_message`: Human-readable failure explanation (or `null`).
+### 3. Deterministic Retrieval & Ranking
+- **Query Sanitization:** Strips FTS control syntax, quotes alphanumeric terms, and applies prefix wildcards (`"term"*`) joined by boolean `AND`.
+- **Ranking:** Scored via SQLite FTS5 BM25 algorithm. Scores represent keyword relevance and term density within matching passages.
+- **Important Score Disclaimer:** Retrieval scores reflect search relevance, **never** diagnostic confidence or failure probabilities.
+- **No Hallucinated References:** Empty matches return an empty list without fabricating references.
 
 ---
 
@@ -76,7 +77,7 @@ Follow these steps in **Windows PowerShell** from the project root directory:
 ```
 *(If PowerShell restricts script execution, run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` first, or activate via `.\.venv\Scripts\activate.bat` in CMD).*
 
-### 2. Install / Update Dependencies
+### 2. Install / Verify Dependencies
 ```powershell
 python -m pip install -r requirements.txt
 ```
@@ -96,9 +97,9 @@ Open `http://localhost:8501` in your browser.
 
 ## Synthetic Data & Scope Boundary Notice
 
-- All incident records in `data/sample/incidents.csv` are **fictional and synthetic**.
-- **No external AI APIs, vector databases, embeddings, or RAG models** are configured in Milestone 2.
-- The **Evidence Search** and **Fault Analysis** sections remain marked as *Planned Features* with disabled UI previews.
+- Incident records in `data/sample/incidents.csv` are **fictional and synthetic**.
+- **No external AI APIs, cloud vector databases, or neural embeddings** are used.
+- The **Fault Analysis** module remains marked as a *Planned Feature* with disabled UI preview.
 
 ---
 
@@ -106,5 +107,5 @@ Open `http://localhost:8501` in your browser.
 
 - [x] **Milestone 1:** Core foundation, synthetic incidents CSV, data loader, filtering, unit tests, and dashboard.
 - [x] **Milestone 2:** Evidence ingestion, secure local document storage, TXT/PDF text extraction, catalog metadata, and inspection.
-- [ ] **Milestone 3:** Chunking, indexing, and local Evidence Search retrieval.
+- [x] **Milestone 3:** Deterministic chunking, persistent SQLite FTS5 indexing, BM25 evidence retrieval, and provenance tracking.
 - [ ] **Milestone 4:** Fault Analysis and evidence-supported diagnostic hypotheses.

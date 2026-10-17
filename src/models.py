@@ -1,9 +1,9 @@
-"""Domain models and schema definitions for GhostFault evidence ingestion."""
+"""Domain models and schema definitions for GhostFault evidence ingestion and retrieval."""
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 class DocumentStatus(str, Enum):
@@ -26,6 +26,7 @@ class ErrorCode(str, Enum):
     STORAGE_ERROR = "ERR_STORAGE_ERROR"
     EXTRACTION_ERROR = "ERR_EXTRACTION_ERROR"
     READ_ERROR = "ERR_READ_ERROR"
+    INDEX_ERROR = "ERR_INDEX_ERROR"
 
 
 @dataclass
@@ -76,6 +77,67 @@ class DocumentMetadata:
             error_code=data.get("error_code"),
             error_message=data.get("error_message"),
         )
+
+
+@dataclass
+class EvidenceChunk:
+    """
+    Structured, validated representation of an indexed evidence chunk.
+    Maintains exact source provenance back to an ingested catalog document.
+    """
+    chunk_id: str
+    document_id: str
+    chunk_index: int
+    text: str
+    source_filename: str
+    file_type: str
+    page_number: Optional[int]
+    start_offset: Optional[int]
+    end_offset: Optional[int]
+    created_at: str
+    content_hash: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize chunk to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EvidenceChunk":
+        """Deserialize chunk from dictionary."""
+        return cls(
+            chunk_id=data["chunk_id"],
+            document_id=data["document_id"],
+            chunk_index=int(data["chunk_index"]),
+            text=data["text"],
+            source_filename=data["source_filename"],
+            file_type=data["file_type"],
+            page_number=data.get("page_number"),
+            start_offset=data.get("start_offset"),
+            end_offset=data.get("end_offset"),
+            created_at=data["created_at"],
+            content_hash=data["content_hash"],
+        )
+
+
+@dataclass
+class SearchResult:
+    """
+    A single ranked evidence passage retrieved from the search index.
+    Contains source provenance and search score.
+    """
+    chunk: EvidenceChunk
+    score: float
+    matched_snippet: str
+    matched_terms: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize search result to dictionary."""
+        return {
+            "chunk": self.chunk.to_dict(),
+            "score": self.score,
+            "matched_snippet": self.matched_snippet,
+            "matched_terms": self.matched_terms,
+        }
 
 
 def current_iso_timestamp() -> str:

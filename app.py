@@ -1,7 +1,8 @@
 """GhostFault - Streamlit Application.
 
 Evidence-first industrial failure intelligence dashboard foundation.
-Includes Milestone 1 incident inspection and Milestone 2 document ingestion.
+Includes Milestone 1 incident inspection, Milestone 2 document ingestion,
+and Milestone 3 evidence chunking, indexing, and deterministic retrieval.
 """
 
 import streamlit as st
@@ -18,6 +19,8 @@ from src.data_loader import (
 from src.ingestion import IngestionService
 from src.storage import EvidenceStore
 from src.models import DocumentStatus
+from src.indexer import SearchIndex
+from src.retriever import EvidenceRetriever
 
 # Page configuration
 st.set_page_config(
@@ -74,6 +77,10 @@ st.markdown(
         border-radius: 4px;
         border: 1px solid rgba(239, 68, 68, 0.4);
     }
+    .result-card {
+        border-left: 4px solid #3b82f6;
+        margin-bottom: 12px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -86,12 +93,20 @@ def get_ingestion_service() -> IngestionService:
     return IngestionService()
 
 
-def render_evidence_ingestion(service: IngestionService) -> None:
-    """Render Milestone 2 Evidence Ingestion interface."""
+@st.cache_resource
+def get_search_components() -> tuple[SearchIndex, EvidenceRetriever]:
+    """Initialize and cache the SearchIndex and EvidenceRetriever instances."""
+    index = SearchIndex()
+    retriever = EvidenceRetriever(index)
+    return index, retriever
+
+
+def render_evidence_ingestion(service: IngestionService, search_index: SearchIndex) -> None:
+    """Render Milestone 2 Evidence Ingestion interface with auto-indexing."""
     st.subheader("📥 Evidence Ingestion & Document Management")
     st.markdown(
         "Upload technical maintenance manuals, operator logs, or failure sheets (`.pdf`, `.txt`). "
-        "Files are validated, stored securely, and cataloged with extracted text references."
+        "Files are validated, stored securely, cataloged, and indexed for deterministic evidence retrieval."
     )
 
     upload_col, info_col = st.columns([3, 2])
@@ -104,8 +119,6 @@ def render_evidence_ingestion(service: IngestionService) -> None:
         )
 
         if uploaded_file is not None:
-            # Prevent duplicate processing of the exact same upload state
-            file_key = f"processed_{uploaded_file.name}_{uploaded_file.size}"
             if st.button("Process & Ingest Document", key="btn_ingest_doc"):
                 with st.spinner(f"Ingesting '{uploaded_file.name}'..."):
                     content_bytes = uploaded_file.getvalue()
@@ -114,13 +127,20 @@ def render_evidence_ingestion(service: IngestionService) -> None:
                         content=content_bytes,
                         source_type="dashboard_upload",
                     )
-                    st.session_state[file_key] = meta.document_id
 
                 if meta.ingestion_status == DocumentStatus.PROCESSED:
-                    st.success(
-                        f"✅ Document successfully ingested! Assigned ID: `{meta.document_id}` "
-                        f"({meta.extracted_character_count:,} characters extracted)."
-                    )
+                    # Automatically index document chunks
+                    extracted_text = service.store.get_extracted_text(meta)
+                    if extracted_text:
+                        chunks_indexed = search_index.index_document(meta, extracted_text)
+                        st.success(
+                            f"✅ Document successfully ingested and indexed! Assigned ID: `{meta.document_id}` "
+                            f"({meta.extracted_character_count:,} characters extracted into {chunks_indexed} chunks)."
+                        )
+                    else:
+                        st.success(
+                            f"✅ Document ingested! Assigned ID: `{meta.document_id}`, but no extracted text was available to index."
+                        )
                 else:
                     st.error(
                         f"❌ Ingestion Failed (`{meta.error_code}`): {meta.error_message}"
@@ -128,13 +148,13 @@ def render_evidence_ingestion(service: IngestionService) -> None:
 
     with info_col:
         with st.container(border=True):
-            st.markdown("**Ingestion Pipeline Specifications:**")
+            st.markdown("**Ingestion & Search Pipeline Specifications:**")
             st.markdown(
                 """
                 - **Supported Formats:** Text-based `.pdf`, `.txt`
                 - **Collision Strategy:** Collision-resistant UUID `DOC-XXXXXXXXXXXX`
-                - **Path Sanitization:** RFC/filesystem traversal safe
-                - **OCR Policy:** Plain selectable text only (Milestone 2 scope)
+                - **Chunking Strategy:** Configurable window (600 chars, 100 overlap) with natural boundaries
+                - **Search Index:** Local persistent SQLite FTS5 with BM25 ranking
                 - **Storage:** Local isolated filesystem under `data/evidence/`
                 """
             )
@@ -144,7 +164,6 @@ def render_evidence_ingestion(service: IngestionService) -> None:
     if docs:
         st.markdown("#### Cataloged Evidence Documents")
         
-        # Summary metrics for ingested corpus
         tot_docs = len(docs)
         succ_docs = sum(1 for d in docs if d.ingestion_status == DocumentStatus.PROCESSED)
         fail_docs = tot_docs - succ_docs
@@ -224,6 +243,106 @@ def render_evidence_ingestion(service: IngestionService) -> None:
                         st.info("No extracted text file found on disk.")
     else:
         st.info("No documents have been ingested yet. Upload a `.pdf` or `.txt` file above to begin.")
+
+
+def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchIndex, store: EvidenceStore) -> None:
+    """Render Milestone 3 Evidence Search & Index Management interface."""
+    st.subheader("🔎 Evidence Search & Passage Retrieval")
+    st.markdown(
+        "Query ingested maintenance records, manuals, and technical notes using deterministic keyword search. "
+        "Every retrieved passage is ranked using SQLite FTS5 BM25 and includes full provenance tracking back to its source document."
+    )
+
+    # Index Status & Sync Controls
+    stats = search_index.get_index_stats()
+    with st.container(border=True):
+        stat_c1, stat_c2, stat_c3, stat_c4 = st.columns([2, 2, 3, 3])
+        with stat_c1:
+            st.metric("Indexed Documents", stats["document_count"])
+        with stat_c2:
+            st.metric("Searchable Chunks", stats["chunk_count"])
+        with stat_c3:
+            last_ts = stats["last_indexed_at"][:19].replace("T", " ") if stats["last_indexed_at"] else "Never"
+            st.metric("Last Index Sync", last_ts)
+        with stat_c4:
+            st.caption("Index Maintenance Actions")
+            action_btn_c1, action_btn_c2 = st.columns(2)
+            with action_btn_c1:
+                if st.button("🔄 Sync Index", help="Synchronize index with all processed catalog documents"):
+                    sync_info = search_index.sync_with_store(store)
+                    st.success(f"Synced {sync_info['indexed_documents']} docs ({sync_info['total_chunks']} chunks).")
+                    st.rerun()
+            with action_btn_c2:
+                if st.button("⚡ Rebuild Index", help="Wipe and rebuild full search index from catalog"):
+                    rebuild_info = search_index.rebuild_index(store)
+                    st.success(f"Rebuilt index with {rebuild_info['total_chunks']} chunks.")
+                    st.rerun()
+
+    # Search query input bar
+    catalog = store.read_catalog()
+    doc_filter_options = ["All Documents"] + [d.document_id for d in catalog if d.ingestion_status == DocumentStatus.PROCESSED]
+
+    search_col1, search_col2, search_col3 = st.columns([5, 2, 1])
+    with search_col1:
+        query = st.text_input(
+            "Search evidence corpus",
+            placeholder="e.g., hydraulic pressure filter, bearing acoustic pitch, vibration",
+            key="search_query_input",
+        )
+    with search_col2:
+        selected_doc_filter = st.selectbox(
+            "Filter by Source Document",
+            options=doc_filter_options,
+            index=0,
+            key="search_doc_filter",
+        )
+    with search_col3:
+        max_results = st.number_input("Max Results", min_value=1, max_value=50, value=5, step=1)
+
+    # Disclaimer on retrieval scores
+    st.caption(
+        "ℹ️ **Note on Search Scores:** Scores represent SQLite FTS5 BM25 keyword relevance, "
+        "not diagnostic confidence or probability of machine failure."
+    )
+
+    if query.strip():
+        with st.spinner("Searching evidence chunks..."):
+            results = retriever.search(
+                query=query,
+                limit=int(max_results),
+                document_id_filter=selected_doc_filter,
+            )
+
+        if results:
+            st.markdown(f"#### Retrieved Evidence Passages ({len(results)} match{'es' if len(results) > 1 else ''})")
+            for i, res in enumerate(results, start=1):
+                chunk = res.chunk
+                with st.container(border=True):
+                    head_c1, head_c2, head_c3 = st.columns([3, 2, 1])
+                    with head_c1:
+                        st.markdown(f"**#{i} Source:** `{chunk.source_filename}`")
+                    with head_c2:
+                        st.caption(f"Doc ID: `{chunk.document_id}` | Chunk #{chunk.chunk_index}")
+                    with head_c3:
+                        st.markdown(f"**Score:** `{res.score:.2f}`")
+
+                    # Highlighted snippet
+                    st.markdown(f"**Matched Passage:**\n\n> {res.matched_snippet}")
+
+                    # Term provenance and offsets
+                    meta_tags = []
+                    if res.matched_terms:
+                        meta_tags.append(f"**Matched Terms:** `{'`, `'.join(res.matched_terms)}`")
+                    if chunk.start_offset is not None and chunk.end_offset is not None:
+                        meta_tags.append(f"**Char Offsets:** `{chunk.start_offset} - {chunk.end_offset}`")
+                    if chunk.page_number is not None:
+                        meta_tags.append(f"**Page:** `{chunk.page_number}`")
+                    else:
+                        meta_tags.append("**Page:** *Unavailable (flattened extracted text)*")
+
+                    st.markdown(" • ".join(meta_tags))
+        else:
+            st.info(f"No matching evidence passages found for query: `{query}`. Try different keywords or sync the index.")
 
 
 def main() -> None:
@@ -337,52 +456,39 @@ def main() -> None:
 
     st.markdown("---")
 
-    # Milestone 2: Evidence Ingestion & Document Management
+    # Shared singletons for ingestion and search
     ingestion_service = get_ingestion_service()
-    render_evidence_ingestion(ingestion_service)
+    search_index, retriever = get_search_components()
+
+    # Milestone 2: Evidence Ingestion & Document Management
+    render_evidence_ingestion(ingestion_service, search_index)
+
+    st.markdown("---")
+
+    # Milestone 3: Evidence Search & Passage Retrieval
+    render_evidence_search(retriever, search_index, ingestion_service.store)
 
     st.markdown("---")
 
     # Future Modules Section
     st.markdown("### Next Phase Modules")
 
-    col_search, col_analysis = st.columns(2)
-
-    with col_search:
-        st.markdown(
-            '#### Evidence Search <span class="planned-badge">Planned Feature</span>',
-            unsafe_allow_html=True,
-        )
-        st.info(
-            "**Semantic Evidence Retrieval is a planned feature.**\n\n"
-            "Future versions will index ingested documents and historical shift logs "
-            "using vector embeddings for cross-document evidence verification."
-        )
-        st.text_input(
-            "Search evidence records (UI Preview)",
-            placeholder="e.g., high harmonic vibration coupling",
-            disabled=True,
-            key="preview_evidence_search_input",
-        )
-        st.button("Search Evidence Corpus", disabled=True, key="preview_evidence_search_btn")
-
-    with col_analysis:
-        st.markdown(
-            '#### Fault Analysis <span class="planned-badge">Planned Feature</span>',
-            unsafe_allow_html=True,
-        )
-        st.info(
-            "**Automated Diagnostic Hypothesis is a planned feature.**\n\n"
-            "Future milestones will synthesize multi-source telemetry and evidence records "
-            "to generate grounded failure hypotheses with confidence scores and citations."
-        )
-        st.selectbox(
-            "Hypothesis Target Mode (UI Preview)",
-            options=["Deterministic Rule Engine", "Evidence-grounded LLM synthesis"],
-            disabled=True,
-            key="preview_fault_analysis_select",
-        )
-        st.button("Run Diagnostic Inference", disabled=True, key="preview_fault_analysis_btn")
+    st.markdown(
+        '#### Fault Analysis <span class="planned-badge">Planned Feature</span>',
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "**Automated Diagnostic Hypothesis is a planned feature.**\n\n"
+        "Future milestones will synthesize multi-source telemetry, maintenance records, and retrieved evidence passages "
+        "to generate grounded failure hypotheses with confidence scores and citations."
+    )
+    st.selectbox(
+        "Hypothesis Target Mode (UI Preview)",
+        options=["Deterministic Rule Engine", "Evidence-grounded LLM synthesis"],
+        disabled=True,
+        key="preview_fault_analysis_select",
+    )
+    st.button("Run Diagnostic Inference", disabled=True, key="preview_fault_analysis_btn")
 
 
 if __name__ == "__main__":
