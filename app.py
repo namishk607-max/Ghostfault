@@ -1,14 +1,17 @@
 """GhostFault - Streamlit Application.
 
 Evidence-first industrial failure intelligence dashboard foundation.
-Includes Milestone 1 incident inspection, Milestone 2 document ingestion,
-and Milestone 3 evidence chunking, indexing, and deterministic retrieval.
+Includes:
+- Milestone 1: Incident dashboard, filters, inspector.
+- Milestone 2: Evidence document ingestion & management.
+- Milestone 3: Chunking, indexing, and deterministic retrieval.
+- Milestone 4 / 4.1 / 4.1.2: Evidence-grounded fault analysis & substantive relevance validation.
 """
 
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from src.data_loader import (
     load_incidents_data,
@@ -18,9 +21,17 @@ from src.data_loader import (
 )
 from src.ingestion import IngestionService
 from src.storage import EvidenceStore
-from src.models import DocumentStatus
+from src.models import (
+    DocumentStatus,
+    AnalysisStatus,
+    EvidenceContextType,
+    MachineScope,
+    PassageQuality,
+    EvidenceCounts,
+)
 from src.indexer import SearchIndex
 from src.retriever import EvidenceRetriever
+from src.analyzer import FaultAnalysisEngine
 
 # Page configuration
 st.set_page_config(
@@ -77,9 +88,65 @@ st.markdown(
         border-radius: 4px;
         border: 1px solid rgba(239, 68, 68, 0.4);
     }
-    .result-card {
-        border-left: 4px solid #3b82f6;
-        margin-bottom: 12px;
+    .status-badge-warning {
+        display: inline-block;
+        background-color: rgba(234, 179, 8, 0.15);
+        color: #ca8a04;
+        font-size: 0.8rem;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 4px;
+        border: 1px solid rgba(234, 179, 8, 0.4);
+    }
+    .badge-scope-exact {
+        display: inline-block;
+        background-color: rgba(59, 130, 246, 0.15);
+        color: #2563eb;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+    .badge-scope-general {
+        display: inline-block;
+        background-color: rgba(100, 116, 139, 0.15);
+        color: #64748b;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(100, 116, 139, 0.3);
+    }
+    .badge-context-illustrative {
+        display: inline-block;
+        background-color: rgba(245, 158, 11, 0.15);
+        color: #d97706;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+    .badge-excerpt {
+        display: inline-block;
+        background-color: rgba(168, 85, 247, 0.15);
+        color: #9333ea;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(168, 85, 247, 0.3);
+    }
+    .badge-excluded {
+        display: inline-block;
+        background-color: rgba(239, 68, 68, 0.1);
+        color: #ef4444;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(239, 68, 68, 0.25);
     }
     </style>
     """,
@@ -94,11 +161,12 @@ def get_ingestion_service() -> IngestionService:
 
 
 @st.cache_resource
-def get_search_components() -> tuple[SearchIndex, EvidenceRetriever]:
-    """Initialize and cache the SearchIndex and EvidenceRetriever instances."""
+def get_search_components() -> tuple[SearchIndex, EvidenceRetriever, FaultAnalysisEngine]:
+    """Initialize and cache the SearchIndex, EvidenceRetriever, and FaultAnalysisEngine instances."""
     index = SearchIndex()
     retriever = EvidenceRetriever(index)
-    return index, retriever
+    analyzer = FaultAnalysisEngine(retriever)
+    return index, retriever, analyzer
 
 
 def render_evidence_ingestion(service: IngestionService, search_index: SearchIndex) -> None:
@@ -129,7 +197,6 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
                     )
 
                 if meta.ingestion_status == DocumentStatus.PROCESSED:
-                    # Automatically index document chunks
                     extracted_text = service.store.get_extracted_text(meta)
                     if extracted_text:
                         chunks_indexed = search_index.index_document(meta, extracted_text)
@@ -153,13 +220,12 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
                 """
                 - **Supported Formats:** Text-based `.pdf`, `.txt`
                 - **Collision Strategy:** Collision-resistant UUID `DOC-XXXXXXXXXXXX`
-                - **Chunking Strategy:** Configurable window (600 chars, 100 overlap) with natural boundaries
+                - **Chunking Strategy:** Sentence-aligned window (600 chars, 100 overlap)
                 - **Search Index:** Local persistent SQLite FTS5 with BM25 ranking
                 - **Storage:** Local isolated filesystem under `data/evidence/`
                 """
             )
 
-    # Ingested Document Catalog & Preview
     docs = service.list_documents()
     if docs:
         st.markdown("#### Cataloged Evidence Documents")
@@ -176,7 +242,6 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
         with met_col3:
             st.metric("Failed Ingestions", fail_docs)
 
-        # Tabular overview
         catalog_table_data = []
         for d in docs:
             catalog_table_data.append({
@@ -194,7 +259,6 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
             hide_index=True,
         )
 
-        # Document Inspector / Extracted Text Preview
         st.markdown("#### Document Inspector & Text Preview")
         doc_options = {d.document_id: f"{d.document_id} — {d.original_filename} ({d.ingestion_status.value})" for d in docs}
         selected_doc_id = st.selectbox(
@@ -253,7 +317,6 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
         "Every retrieved passage is ranked using SQLite FTS5 BM25 and includes full provenance tracking back to its source document."
     )
 
-    # Index Status & Sync Controls
     stats = search_index.get_index_stats()
     with st.container(border=True):
         stat_c1, stat_c2, stat_c3, stat_c4 = st.columns([2, 2, 3, 3])
@@ -278,7 +341,6 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
                     st.success(f"Rebuilt index with {rebuild_info['total_chunks']} chunks.")
                     st.rerun()
 
-    # Search query input bar
     catalog = store.read_catalog()
     doc_filter_options = ["All Documents"] + [d.document_id for d in catalog if d.ingestion_status == DocumentStatus.PROCESSED]
 
@@ -299,7 +361,6 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
     with search_col3:
         max_results = st.number_input("Max Results", min_value=1, max_value=50, value=5, step=1)
 
-    # Disclaimer on retrieval scores
     st.caption(
         "ℹ️ **Note on Search Scores:** Scores represent SQLite FTS5 BM25 keyword relevance, "
         "not diagnostic confidence or probability of machine failure."
@@ -326,10 +387,8 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
                     with head_c3:
                         st.markdown(f"**Score:** `{res.score:.2f}`")
 
-                    # Highlighted snippet
                     st.markdown(f"**Matched Passage:**\n\n> {res.matched_snippet}")
 
-                    # Term provenance and offsets
                     meta_tags = []
                     if res.matched_terms:
                         meta_tags.append(f"**Matched Terms:** `{'`, `'.join(res.matched_terms)}`")
@@ -345,15 +404,192 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
             st.info(f"No matching evidence passages found for query: `{query}`. Try different keywords or sync the index.")
 
 
+def render_fault_analysis(analyzer: FaultAnalysisEngine, selected_record: Optional[pd.Series]) -> None:
+    """Render Milestone 4.1.2 Evidence-Grounded Fault Analysis interface."""
+    st.subheader("🧠 Evidence-Grounded Fault Analysis")
+    st.markdown(
+        "Generate explainable, evidence-backed investigative hypotheses for the selected incident. "
+        "The engine validates passage substance, excludes low-value keyword lists, deduplicates identical source copies, "
+        "and distinguishes machine scopes with complete provenance traceability."
+    )
+
+    if selected_record is None:
+        st.info("Please select an incident above to perform fault analysis.")
+        return
+
+    incident_dict = selected_record.to_dict()
+    incident_id = incident_dict.get("incident_id", "UNKNOWN")
+
+    analysis_key = f"analysis_result_{incident_id}"
+
+    btn_col, status_col = st.columns([2, 5])
+    with btn_col:
+        run_analysis = st.button("🚀 Run Fault Analysis", key=f"btn_run_analysis_{incident_id}")
+
+    if run_analysis or analysis_key in st.session_state:
+        if run_analysis:
+            with st.spinner("Analyzing incident symptoms against retrieved evidence corpus..."):
+                analysis_result = analyzer.analyze_incident(incident_dict)
+                st.session_state[analysis_key] = analysis_result
+        else:
+            analysis_result = st.session_state[analysis_key]
+
+        with status_col:
+            if analysis_result.status == AnalysisStatus.COMPLETED:
+                st.markdown(
+                    f'Analysis Status: <span class="status-badge-success">COMPLETED ({len(analysis_result.hypotheses)} HYPOTHESIS)</span>',
+                    unsafe_allow_html=True,
+                )
+            elif analysis_result.status == AnalysisStatus.INSUFFICIENT_EVIDENCE:
+                st.markdown(
+                    'Analysis Status: <span class="status-badge-warning">INSUFFICIENT EVIDENCE</span>',
+                    unsafe_allow_html=True,
+                )
+            elif analysis_result.status == AnalysisStatus.NO_EVIDENCE:
+                st.markdown(
+                    'Analysis Status: <span class="status-badge-failed">NO MATCHING EVIDENCE</span>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'Analysis Status: <span class="status-badge-failed">FAILED: {analysis_result.error_message}</span>',
+                    unsafe_allow_html=True,
+                )
+
+        # Milestone 4.1.2: Evidence Count Pipeline Metrics Bar
+        counts: Optional[EvidenceCounts] = getattr(analysis_result, "evidence_counts", None)
+        if counts:
+            with st.container(border=True):
+                st.caption("**Evidence Pipeline Derivation Counts:**")
+                cnt_c1, cnt_c2, cnt_c3, cnt_c4, cnt_c5 = st.columns(5)
+                with cnt_c1:
+                    st.metric("Raw Retrieved", counts.raw_retrieved_count)
+                with cnt_c2:
+                    st.metric("Unique Passages", counts.unique_deduplicated_count)
+                with cnt_c3:
+                    st.metric("Substantive Retained", counts.substantive_retained_count)
+                with cnt_c4:
+                    st.metric("Excluded Low-Value", counts.excluded_low_value_count)
+                with cnt_c5:
+                    st.metric("Hypothesis-Supporting", counts.supporting_hypotheses_count)
+
+        st.markdown("---")
+
+        col_hyp, col_ev = st.columns([5, 4])
+
+        with col_hyp:
+            st.markdown("#### 🔬 Investigative Hypotheses")
+            if analysis_result.hypotheses:
+                for idx, hyp in enumerate(analysis_result.hypotheses, start=1):
+                    with st.container(border=True):
+                        st.markdown(f"##### Hypothesis #{idx}: {hyp.title}")
+                        st.markdown(f"*{hyp.description}*")
+                        st.caption(f"**Qualification:** {hyp.qualification}")
+
+                        # Retrieved Supporting References (accurate wording separating incident-specific from general)
+                        if hyp.supporting_evidence:
+                            st.markdown(f"**Retrieved Supporting References ({len(hyp.supporting_evidence)}):**")
+                            for s_ref in hyp.supporting_evidence:
+                                scope = getattr(s_ref, "machine_scope", MachineScope.GENERAL_REFERENCE)
+                                ref_machine = getattr(s_ref, "referenced_machine_id", None)
+                                ctx_type = getattr(s_ref, "context_type", EvidenceContextType.GENERAL_REFERENCE)
+                                is_excerpt = getattr(s_ref, "is_excerpt", False)
+                                dup_copies = getattr(s_ref, "duplicate_source_copies", None)
+
+                                scope_badge = (
+                                    f'<span class="badge-scope-exact">Machine {ref_machine} Record</span> '
+                                    if scope == MachineScope.EXACT_MACHINE
+                                    else '<span class="badge-scope-general">General Technical Reference</span> '
+                                )
+                                context_badge = (
+                                    '<span class="badge-context-illustrative">⚠️ Illustrative Test Values</span> '
+                                    if ctx_type == EvidenceContextType.ILLUSTRATIVE_TEST_VALUE
+                                    else ""
+                                )
+                                excerpt_badge = (
+                                    '<span class="badge-excerpt">Excerpt</span> '
+                                    if is_excerpt
+                                    else ""
+                                )
+
+                                st.markdown(
+                                    f"- **Source:** `{s_ref.source_filename}` (`{s_ref.document_id}` / Chunk #{s_ref.chunk_index}) "
+                                    f"{scope_badge}{context_badge}{excerpt_badge}\n"
+                                    f"  > {s_ref.snippet}\n"
+                                    f"  *Support Basis:* {s_ref.relevance_reason}",
+                                    unsafe_allow_html=True,
+                                )
+
+                                if dup_copies:
+                                    dup_list = ", ".join(
+                                        [f"`{c['source_filename']}` (`{c['document_id']}`)" for c in dup_copies]
+                                    )
+                                    st.caption(f"  ℹ️ *Identical/near-duplicate passage copies detected in:* {dup_list} *(grouped to prevent false independent corroboration)*")
+
+                        # Contradictory or Cross-Machine Evidence
+                        if hyp.contradictory_evidence:
+                            st.markdown("⚠️ **Contradictory / Cross-Machine Flags:**")
+                            for c_ref in hyp.contradictory_evidence:
+                                st.warning(
+                                    f"**Cross-Unit Alert in `{c_ref.source_filename}` (`{c_ref.document_id}`):**\n\n"
+                                    f"{c_ref.relevance_reason}\n\n"
+                                    f"> {c_ref.snippet}"
+                                )
+
+                        # Recommended Technical Checks
+                        st.markdown("**Suggested Technical Checks (Requires OEM Procedures & Human Judgment):**")
+                        for check in hyp.suggested_checks:
+                            st.markdown(f"- 🔧 {check}")
+            else:
+                st.info(
+                    "No diagnostic hypotheses could be substantiated. "
+                    "The deterministic rule engine requires concrete, substantive corroborating evidence in the index "
+                    "before proposing an investigative hypothesis."
+                )
+
+        with col_ev:
+            st.markdown("#### 📑 Grounding Evidence Passages")
+            substantive_count_label = counts.substantive_retained_count if counts else len(analysis_result.retrieved_evidence)
+            st.caption(f"Retained {substantive_count_label} substantive passages matching incident keywords.")
+            if analysis_result.retrieved_evidence:
+                for ev in analysis_result.retrieved_evidence:
+                    with st.container(border=True):
+                        st.markdown(f"**Source:** `{ev.chunk.source_filename}` (`{ev.chunk.document_id}`)")
+                        st.markdown(f"> {ev.matched_snippet}")
+                        st.caption(f"Chunk #{ev.chunk.chunk_index} • BM25 Score: `{ev.score:.2f}`")
+            else:
+                st.warning("No evidence passages retrieved for this incident.")
+
+            # Milestone 4.1.2: Excluded or Low-Value Retrieval Results Section
+            excluded_list = getattr(analysis_result, "excluded_evidence", None)
+            if excluded_list:
+                st.markdown("#### 🚫 Excluded or Low-Value Retrieval Results")
+                st.caption("Passages containing only indexing search terms or header metadata are excluded from grounding hypotheses:")
+                for exc in excluded_list:
+                    with st.container(border=True):
+                        st.markdown(f"**Source:** `{exc.source_filename}` (`{exc.document_id}`) <span class='badge-excluded'>Excluded</span>", unsafe_allow_html=True)
+                        st.markdown(f"> {exc.snippet}")
+                        st.caption(f"⚠️ *Reason for exclusion:* {exc.exclusion_reason}")
+
+            st.markdown("#### ⚠️ Missing Information & Scope Limitations")
+            with st.container(border=True):
+                st.markdown("**Missing Diagnostic Data:**")
+                for missing in analysis_result.missing_information:
+                    st.markdown(f"- ❓ {missing}")
+
+                st.markdown("---")
+                st.markdown("**Safety & Technical Limitations:**")
+                for lim in analysis_result.limitations:
+                    st.markdown(f"- ⚠️ {lim}")
+
+
 def main() -> None:
-    # Header
     st.markdown('<div class="ghost-title">GhostFault</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="ghost-subtitle">Evidence-first industrial failure intelligence</div>',
         unsafe_allow_html=True,
     )
 
-    # Attempt to load dataset
     try:
         raw_df = load_incidents_data()
     except DatasetLoadError as err:
@@ -363,7 +599,6 @@ def main() -> None:
         )
         st.stop()
 
-    # Sidebar: Filtering Controls
     with st.sidebar:
         st.header("Controls & Filters")
         machine_options = ["All Machines"] + sorted(raw_df["machine_id"].unique().tolist())
@@ -384,10 +619,8 @@ def main() -> None:
             """
         )
 
-    # Apply Machine Filter
     filtered_df = filter_by_machine(raw_df, selected_machine)
 
-    # Key Metrics Bar
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric(label="Total Incidents", value=len(filtered_df))
@@ -403,7 +636,6 @@ def main() -> None:
 
     st.markdown("---")
 
-    # Incident Table
     st.subheader("Maintenance Incidents Table")
     if filtered_df.empty:
         st.info("No records match the current filter selection.")
@@ -422,8 +654,8 @@ def main() -> None:
             hide_index=True,
         )
 
-    # Incident Inspector / Details Selector
     st.subheader("Incident Detail Inspector")
+    selected_record: Optional[pd.Series] = None
     if not filtered_df.empty:
         available_ids = filtered_df["incident_id"].tolist()
         selected_id = st.selectbox(
@@ -433,35 +665,34 @@ def main() -> None:
             key=f"inspector_select_{selected_machine}",
         )
 
-        record = get_incident_by_id(filtered_df, selected_id)
-        if record is not None:
+        selected_record = get_incident_by_id(filtered_df, selected_id)
+        if selected_record is not None:
             with st.container(border=True):
                 sub_col1, sub_col2, sub_col3 = st.columns(3)
                 with sub_col1:
                     st.caption("Incident ID")
-                    st.markdown(f"**`{record['incident_id']}`**")
+                    st.markdown(f"**`{selected_record['incident_id']}`**")
                 with sub_col2:
                     st.caption("Machine ID")
-                    st.markdown(f"**`{record['machine_id']}`**")
+                    st.markdown(f"**`{selected_record['machine_id']}`**")
                 with sub_col3:
                     st.caption("Incident Date")
-                    st.markdown(f"**{record['date']}**")
+                    st.markdown(f"**{selected_record['date']}**")
 
                 st.markdown("---")
-                st.markdown(f"**Reported Symptom:**\n\n{record['symptom']}")
-                st.markdown(f"**Maintenance Action Taken:**\n\n{record['maintenance_action']}")
-                st.markdown(f"**Outcome & Verification:**\n\n{record['outcome']}")
+                st.markdown(f"**Reported Symptom:**\n\n{selected_record['symptom']}")
+                st.markdown(f"**Maintenance Action Taken:**\n\n{selected_record['maintenance_action']}")
+                st.markdown(f"**Outcome & Verification:**\n\n{selected_record['outcome']}")
     else:
         st.info("No incident available for the selected filter.")
 
     st.markdown("---")
 
-    # Shared singletons for ingestion and search
     ingestion_service = get_ingestion_service()
-    search_index, retriever = get_search_components()
+    search_index, retriever, analyzer = get_search_components()
 
-    # Milestone 2: Evidence Ingestion & Document Management
-    render_evidence_ingestion(ingestion_service, search_index)
+    # Milestone 4.1.2: Evidence-Grounded Fault Analysis
+    render_fault_analysis(analyzer, selected_record)
 
     st.markdown("---")
 
@@ -470,25 +701,8 @@ def main() -> None:
 
     st.markdown("---")
 
-    # Future Modules Section
-    st.markdown("### Next Phase Modules")
-
-    st.markdown(
-        '#### Fault Analysis <span class="planned-badge">Planned Feature</span>',
-        unsafe_allow_html=True,
-    )
-    st.info(
-        "**Automated Diagnostic Hypothesis is a planned feature.**\n\n"
-        "Future milestones will synthesize multi-source telemetry, maintenance records, and retrieved evidence passages "
-        "to generate grounded failure hypotheses with confidence scores and citations."
-    )
-    st.selectbox(
-        "Hypothesis Target Mode (UI Preview)",
-        options=["Deterministic Rule Engine", "Evidence-grounded LLM synthesis"],
-        disabled=True,
-        key="preview_fault_analysis_select",
-    )
-    st.button("Run Diagnostic Inference", disabled=True, key="preview_fault_analysis_btn")
+    # Milestone 2: Evidence Ingestion & Document Management
+    render_evidence_ingestion(ingestion_service, search_index)
 
 
 if __name__ == "__main__":

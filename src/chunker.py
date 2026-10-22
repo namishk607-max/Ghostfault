@@ -1,7 +1,7 @@
 """Isolated text chunking engine for GhostFault evidence documents.
 
 Splits extracted document text into deterministic passages preserving natural
-paragraph boundaries, word boundaries, and character offsets.
+paragraph boundaries, sentence boundaries, word boundaries, and character offsets.
 """
 
 import hashlib
@@ -48,12 +48,11 @@ class TextChunker:
         """
         Split text into (passage_text, start_char_offset, end_char_offset).
         Guarantees natural boundaries (paragraph, sentence, space), monotonic progress,
-        and avoids infinite loops.
+        and avoids starting chunks mid-sentence or mid-word when overlapping.
         """
         if not text or not text.strip():
             return []
 
-        # Standardize line breaks while preserving length/offsets
         text_len = len(text)
         passages: List[Tuple[str, int, int]] = []
 
@@ -69,45 +68,62 @@ class TextChunker:
             target_end = min(start_idx + self.chunk_size, text_len)
 
             if target_end >= text_len:
-                # Remaining text fits in the current chunk window
                 end_idx = text_len
             else:
-                # Search for a natural boundary to split between (start_idx + min_chunk) and target_end
-                # Look for paragraph break (\n\n), then sentence ending (. / ! / ?), then newline (\n), then space
                 min_cut = start_idx + (self.chunk_size // 2)
                 window = text[min_cut:target_end]
 
-                # Check paragraph break
+                # 1. Paragraph break (\n\s*\n)
                 para_match = [m.start() for m in re.finditer(r"\n\s*\n", window)]
                 if para_match:
                     end_idx = min_cut + para_match[-1]
                 else:
-                    # Check sentence ending
-                    sent_match = [m.start() for m in re.finditer(r"[.!?]\s", window)]
+                    # 2. Sentence ending (. / ! / ?) followed by space, newline, or end
+                    sent_match = [m.start() for m in re.finditer(r"[.!?](?:\s|$)", window)]
                     if sent_match:
                         end_idx = min_cut + sent_match[-1] + 1
                     else:
-                        # Check single newline
+                        # 3. Single newline
                         nl_match = [m.start() for m in re.finditer(r"\n", window)]
                         if nl_match:
                             end_idx = min_cut + nl_match[-1]
                         else:
-                            # Check whitespace
+                            # 4. Word boundary (whitespace)
                             space_match = [m.start() for m in re.finditer(r"\s", window)]
                             if space_match:
                                 end_idx = min_cut + space_match[-1]
                             else:
                                 end_idx = target_end
 
-            chunk_text = text[start_idx:end_idx].strip()
+            chunk_raw = text[start_idx:end_idx]
+            chunk_text = chunk_raw.strip()
             if chunk_text:
                 passages.append((chunk_text, start_idx, end_idx))
 
             if end_idx >= text_len:
                 break
 
-            # Calculate next start position using overlap
-            next_start = end_idx - self.chunk_overlap
+            # Calculate next start position using overlap window: [end_idx - chunk_overlap, end_idx]
+            overlap_min = max(start_idx + 1, end_idx - self.chunk_overlap)
+            overlap_window = text[overlap_min:end_idx]
+
+            # Priority 1: Align to a clean paragraph start inside the overlap window
+            p_starts = [overlap_min + m.end() for m in re.finditer(r"\n\s*\n", overlap_window)]
+            # Priority 2: Align to a clean sentence start inside the overlap window (.!? followed by whitespace)
+            s_starts = [overlap_min + m.end() for m in re.finditer(r"[.!?]\s+", overlap_window)]
+            # Priority 3: Align to a clean newline start
+            nl_starts = [overlap_min + m.end() for m in re.finditer(r"\n+", overlap_window)]
+
+            if p_starts:
+                next_start = p_starts[0]
+            elif s_starts:
+                next_start = s_starts[0]
+            elif nl_starts:
+                next_start = nl_starts[0]
+            else:
+                # If no sentence/paragraph break in overlap window, advance to end_idx to guarantee complete sentences
+                next_start = end_idx
+
             # Ensure strictly monotonic forward progress
             if next_start <= start_idx:
                 next_start = end_idx

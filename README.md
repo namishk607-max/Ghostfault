@@ -27,43 +27,52 @@ Ghostvault/
 ├── src/
 │   ├── __init__.py
 │   ├── data_loader.py       # Incident dataset validation, relative loading, and filtering
-│   ├── models.py            # Ingestion & retrieval models (DocumentMetadata, EvidenceChunk, SearchResult)
+│   ├── models.py            # Typed domain models (Incidents, Chunks, SearchResults, Hypotheses, Scopes)
 │   ├── extractor.py         # Isolated text extraction for TXT and PDF (pypdf)
 │   ├── storage.py           # Atomic writes, path traversal sanitization, and catalog management
 │   ├── ingestion.py         # Ingestion orchestration and pre-validation pipeline
 │   ├── chunker.py           # Deterministic text chunker with natural boundaries & offsets
 │   ├── indexer.py           # Persistent SQLite FTS5 index manager with change tracking
-│   └── retriever.py         # Deterministic keyword retrieval with BM25 ranking & snippet highlights
+│   ├── retriever.py         # Deterministic keyword retrieval with BM25 ranking & snippet highlights
+│   └── analyzer.py          # Evidence-grounded fault analysis engine & quality hardening
 └── tests/
     ├── test_incidents.py    # Unit tests for incident dataset integrity and filtering
     ├── test_ingestion.py    # Unit tests for document ingestion, validation, and extraction
-    └── test_retrieval.py    # Unit tests for chunking, FTS5 indexing, and BM25 retrieval
+    ├── test_retrieval.py    # Unit tests for chunking, FTS5 indexing, and BM25 retrieval
+    └── test_analysis.py     # Unit tests for fault analysis, deduplication, and quality hardening
 ```
 
 ---
 
-## Milestone 3: Evidence Chunking, Indexing & Retrieval
+## Milestone 4 & 4.1 / 4.1.2: Evidence-Grounded Fault Analysis & Quality Validation
 
-Milestone 3 delivers a reliable, deterministic local evidence retrieval engine:
+Milestone 4.1 and 4.1.2 enhance evidence quality, traceability, deterministic passage validation, and strict hypothesis qualification:
 
-### 1. Chunking Policy & Configuration Defaults
-- **Chunk Size:** 600 characters (`DEFAULT_CHUNK_SIZE`), bounded between 100 and 4,000 characters.
-- **Overlap:** 100 characters (`DEFAULT_CHUNK_OVERLAP`) to avoid losing context across boundaries.
-- **Natural Boundary Detection:** Prefers paragraph boundaries (`\n\n`), then sentence endings (`. `, `! `, `? `), then newlines (`\n`), and spaces before falling back to fixed cuts.
-- **Provenance:** Every chunk retains `document_id`, `source_filename`, `file_type`, character `start_offset`, `end_offset`, `content_hash`, and a collision-resistant deterministic `chunk_id` (`<doc_id>_CHK<index>_<hash>`).
-- **Page Numbers:** Explicitly labeled as *Unavailable* when documents have been stored as flattened extracted text, avoiding fabricated page provenance.
+### 1. Deterministic Passage Quality Classification (Milestone 4.1.2)
+- **Substantive Technical Content:** Classifies genuine operational notes, maintenance steps, physical symptom reports, and component descriptions.
+- **Search Terms / Metadata Exclusion:** Identifies search-term keyword lists and administrative headers (e.g. `Search terms: bearing temperature...`), preventing them from masquerading as substantive evidence.
+- **Excluded Evidence Audit Drawer:** Low-value or metadata passages are displayed transparently in an "Excluded or Low-Value Retrieval Results" drawer with clear reasons for exclusion.
+- **Transparent Pipeline Metrics:** Shows exact counts for Raw Retrieved, Unique (Deduplicated), Substantive Retained, Excluded Low-Value, and Supporting Hypotheses passages.
 
-### 2. Search Index & Storage
-- **Backend:** Embedded **SQLite FTS5** virtual table (`chunks_fts`) using Porter stemming and unicode61 tokenizer.
-- **Persistence Location:** `data/evidence/index/evidence_index.db` (100% local, excluded from Git).
-- **Change Detection & Transactions:** Documents are fingerprinted via SHA-256. Re-indexing identical documents is a no-op; updating document text replaces stale chunks atomically within a database transaction.
-- **Lifecycle Operations:** Supports automatic indexing upon successful ingestion, manual on-demand `Sync Index`, and a full zero-loss `Rebuild Index`.
+### 2. Duplicate Evidence Handling & Deduplication
+- **Multi-Copy Detection:** Detects identical and near-duplicate passages across different uploads or formats (e.g., TXT vs PDF duplicates of the same manual).
+- **No False Corroboration:** Repeated copies of substantially identical passages are grouped under the primary reference rather than counted as separate independent corroboration.
+- **Traceability Preservation:** All genuine source filenames, document IDs, and chunk indices for every copy are preserved and displayed in the duplicate audit drawer.
 
-### 3. Deterministic Retrieval & Ranking
-- **Query Sanitization:** Strips FTS control syntax, quotes alphanumeric terms, and applies prefix wildcards (`"term"*`) joined by boolean `AND`.
-- **Ranking:** Scored via SQLite FTS5 BM25 algorithm. Scores represent keyword relevance and term density within matching passages.
-- **Important Score Disclaimer:** Retrieval scores reflect search relevance, **never** diagnostic confidence or failure probabilities.
-- **No Hallucinated References:** Empty matches return an empty list without fabricating references.
+### 3. Sentence-Bounded Snippets & Readability
+- **Faithful Boundaries:** Snippets cut cleanly at complete sentence boundaries (`. `, `! `, `? `) or paragraph breaks, avoiding mid-word truncations.
+- **Excerpt Flagging:** In the rare case where chunk start offsets fall mid-sentence, snippets are explicitly labeled with `[Excerpt - begins mid-sentence in source chunk]`.
+- **No Text Fabrication:** Snippets reflect verbatim extracted text without paraphrasing or quote modification.
+
+### 4. Context & Relationship-Specific Support Reasons
+- **Genuine Relationships:** Distinguishes symptom co-occurrence, general mechanisms, historical maintenance, and physical observations rather than emitting generic keyword lists.
+- **Measurement Context:** Distinguishes between recorded incident facts, verified manufacturer OEM limits, and illustrative/synthetic test values with caution badges.
+- **Machine Scope Discrimination:** General technical references are clearly separated from machine-specific evidence (e.g., M-104 vs M-999 or general manuals).
+
+### 5. Strict Hypothesis Qualification
+- **Tentative Wording:** Emphasizes that symptom correlation indicates potential failure mechanisms but **does not confirm root cause** without physical technician inspection.
+- **No Root Cause Filling:** Where evidence is absent or insufficient, reports `INSUFFICIENT_EVIDENCE` or `NO_EVIDENCE` rather than fabricating diagnostic causes.
+- **Low-Value Protection:** If retrieval only matches search-term lists or metadata, the system returns `INSUFFICIENT_EVIDENCE` with 0 hypotheses.
 
 ---
 
@@ -95,11 +104,11 @@ Open `http://localhost:8501` in your browser.
 
 ---
 
-## Synthetic Data & Scope Boundary Notice
+## Synthetic Data & Safety Disclaimer
 
 - Incident records in `data/sample/incidents.csv` are **fictional and synthetic**.
 - **No external AI APIs, cloud vector databases, or neural embeddings** are used.
-- The **Fault Analysis** module remains marked as a *Planned Feature* with disabled UI preview.
+- Investigative hypotheses are **preliminary technical suggestions** grounded in available documentation and require qualified human judgment and standard OEM maintenance/lockout procedures.
 
 ---
 
@@ -108,4 +117,6 @@ Open `http://localhost:8501` in your browser.
 - [x] **Milestone 1:** Core foundation, synthetic incidents CSV, data loader, filtering, unit tests, and dashboard.
 - [x] **Milestone 2:** Evidence ingestion, secure local document storage, TXT/PDF text extraction, catalog metadata, and inspection.
 - [x] **Milestone 3:** Deterministic chunking, persistent SQLite FTS5 indexing, BM25 evidence retrieval, and provenance tracking.
-- [ ] **Milestone 4:** Fault Analysis and evidence-supported diagnostic hypotheses.
+- [x] **Milestone 4:** Evidence-grounded fault analysis, explainable hypothesis generation, and cross-machine validation.
+- [x] **Milestone 4.1:** Evidence quality and traceability hardening (deduplication, sentence boundaries, scope/context classification).
+- [ ] **Milestone 5:** Future system expansion.
