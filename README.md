@@ -2,7 +2,7 @@
 
 > **Evidence-first industrial failure intelligence**
 
-GhostFault connects maintenance records, machine manuals, and incident reports to identify recurring failure patterns and generate evidence-supported diagnostic hypotheses.
+GhostFault connects maintenance records, machine manuals, and incident reports to identify recurring failure patterns and generate evidence-supported diagnostic hypotheses. It runs entirely locally — no cloud services, paid APIs, or neural embeddings required.
 
 ---
 
@@ -44,35 +44,72 @@ Ghostvault/
 
 ---
 
-## Milestone 4 & 4.1 / 4.1.2: Evidence-Grounded Fault Analysis & Quality Validation
+## Features
 
-Milestone 4.1 and 4.1.2 enhance evidence quality, traceability, deterministic passage validation, and strict hypothesis qualification:
+### Incident Dashboard & Inspector
+- Interactive Streamlit dashboard for browsing synthetic industrial maintenance incidents.
+- Machine-based filtering (e.g. M-104, M-205, M-308) with incident tables showing date, symptom, action, and outcome.
+- Incident Detail Inspector: selecting any row renders a full detail panel with incident ID, machine ID, date, reported symptom, maintenance action, and outcome.
+- Dark-themed, responsive layout with graceful handling of missing or malformed records.
 
-### 1. Deterministic Passage Quality Classification (Milestone 4.1.2)
-- **Substantive Technical Content:** Classifies genuine operational notes, maintenance steps, physical symptom reports, and component descriptions.
-- **Search Terms / Metadata Exclusion:** Identifies search-term keyword lists and administrative headers (e.g. `Search terms: bearing temperature...`), preventing them from masquerading as substantive evidence.
-- **Excluded Evidence Audit Drawer:** Low-value or metadata passages are displayed transparently in an "Excluded or Low-Value Retrieval Results" drawer with clear reasons for exclusion.
-- **Transparent Pipeline Metrics:** Shows exact counts for Raw Retrieved, Unique (Deduplicated), Substantive Retained, Excluded Low-Value, and Supporting Hypotheses passages.
+### Document Ingestion & Evidence Storage
+- Local PDF and TXT file upload via the Streamlit interface.
+- Automated text extraction (plain text passthrough, pypdf-based PDF extraction).
+- Secure local storage: originals preserved with sanitized filenames, extracted text stored as UTF-8.
+- Structured document catalog (`catalog.json`) with document IDs, filenames, file types, ingestion status, timestamps, and error tracking.
+- Validation pipeline: rejects empty files, whitespace-only content, unsupported file types, and path-traversal attempts with explicit error messages.
 
-### 2. Duplicate Evidence Handling & Deduplication
-- **Multi-Copy Detection:** Detects identical and near-duplicate passages across different uploads or formats (e.g., TXT vs PDF duplicates of the same manual).
-- **No False Corroboration:** Repeated copies of substantially identical passages are grouped under the primary reference rather than counted as separate independent corroboration.
-- **Traceability Preservation:** All genuine source filenames, document IDs, and chunk indices for every copy are preserved and displayed in the duplicate audit drawer.
+### Evidence Chunking, Indexing & Retrieval
+- Deterministic text chunking with configurable size, overlap, and natural boundary detection (sentence and paragraph breaks).
+- Persistent SQLite FTS5 full-text search index with content hashing for change tracking and stale-chunk replacement.
+- BM25-ranked keyword retrieval with snippet highlighting and configurable result limits.
+- Document-scoped search filtering and empty/special-character query handling.
+- Full provenance: every chunk links back to its source document ID, filename, chunk index, and character offsets.
 
-### 3. Sentence-Bounded Snippets & Readability
-- **Faithful Boundaries:** Snippets cut cleanly at complete sentence boundaries (`. `, `! `, `? `) or paragraph breaks, avoiding mid-word truncations.
-- **Excerpt Flagging:** In the rare case where chunk start offsets fall mid-sentence, snippets are explicitly labeled with `[Excerpt - begins mid-sentence in source chunk]`.
-- **No Text Fabrication:** Snippets reflect verbatim extracted text without paraphrasing or quote modification.
+### Evidence-Grounded Fault Analysis
+- Pattern-based hypothesis generation: matches incident symptoms and maintenance actions against known industrial failure patterns (bearing wear, lubrication degradation, seal failure, hydraulic faults).
+- Hypotheses are linked to concrete retrieved evidence passages — no unsupported claims.
+- Tentative qualification: every hypothesis explicitly states that symptom correlation does not confirm root cause without physical inspection.
+- `INSUFFICIENT_EVIDENCE` / `NO_EVIDENCE` status when retrieved evidence is absent or inadequate — the system never fabricates a diagnosis.
 
-### 4. Context & Relationship-Specific Support Reasons
-- **Genuine Relationships:** Distinguishes symptom co-occurrence, general mechanisms, historical maintenance, and physical observations rather than emitting generic keyword lists.
-- **Measurement Context:** Distinguishes between recorded incident facts, verified manufacturer OEM limits, and illustrative/synthetic test values with caution badges.
-- **Machine Scope Discrimination:** General technical references are clearly separated from machine-specific evidence (e.g., M-104 vs M-999 or general manuals).
+### Duplicate Evidence Handling
+- Exact-duplicate and near-duplicate passage detection across different uploads and formats (e.g. TXT vs PDF copies of the same manual).
+- Grouped deduplication: repeated copies of substantially identical text are consolidated under the primary reference rather than counted as independent corroboration.
+- Full provenance preserved: all genuine source filenames, document IDs, and chunk indices for every copy are listed in a duplicate audit drawer.
 
-### 5. Strict Hypothesis Qualification
-- **Tentative Wording:** Emphasizes that symptom correlation indicates potential failure mechanisms but **does not confirm root cause** without physical technician inspection.
-- **No Root Cause Filling:** Where evidence is absent or insufficient, reports `INSUFFICIENT_EVIDENCE` or `NO_EVIDENCE` rather than fabricating diagnostic causes.
-- **Low-Value Protection:** If retrieval only matches search-term lists or metadata, the system returns `INSUFFICIENT_EVIDENCE` with 0 hypotheses.
+### Passage Quality Classification & Filtering
+- Deterministic classifier identifies four passage types:
+  - **Substantive Technical**: Operational notes, maintenance steps, symptom reports, and component descriptions.
+  - **Search Terms / Indexing Metadata**: Keyword lists (e.g. `Search terms: bearing temperature, elevated temperature...`) — excluded from hypothesis support.
+  - **Header / Footer Metadata**: Administrative document headers (Document ID, Record Type, Equipment blocks) — excluded from hypothesis support.
+  - **Empty / Low-Substance**: Fragmentary tokens too brief to convey diagnostic facts.
+- Low-value passages are transparently displayed under an "Excluded or Low-Value Retrieval Results" diagnostic section with the specific reason for exclusion.
+- If all retrieved passages are non-substantive, the system returns `INSUFFICIENT_EVIDENCE` with zero hypotheses.
+
+### Transparent Pipeline Metrics
+- Dashboard displays five separately derived counts (not invented — computed from actual pipeline results):
+  - **Raw Retrieved** — total chunks returned by keyword retrieval.
+  - **Unique (Deduplicated)** — chunks after exact and near-duplicate grouping.
+  - **Substantive Retained** — passages classified as genuine technical content.
+  - **Excluded Low-Value** — passages filtered out (search terms, metadata, empty).
+  - **Supporting Hypotheses** — passages actively grounding investigative hypotheses.
+
+### Sentence-Bounded Snippets & Readability
+- Snippets prefer complete sentence boundaries (`. `, `! `, `? `) and paragraph breaks over mid-word truncation.
+- When a source chunk begins mid-sentence, the snippet is explicitly labeled as an excerpt.
+- Verbatim extracted text only — no paraphrasing, rewriting, or fabricated quotations.
+
+### Context-Aware Support Reasons
+- Each evidence passage receives a relationship-specific support reason rather than a generic keyword list:
+  - **Direct incident observations** — machine-specific notes from the selected unit.
+  - **General technical mechanisms** — OEM or reference material discussing potential failure modes without asserting they apply to a specific machine.
+  - **Historical maintenance** — past corrective actions, inspections, and retorquing records.
+  - **Illustrative test context** — synthetic or reference readings clearly tagged so they are not mistaken for physical telemetry.
+
+### Machine Scope Discrimination
+- **Exact Machine** — passages referencing the selected unit (e.g. M-104) are tagged as direct machine evidence.
+- **General Reference** — passages without specific machine identifiers are treated as general technical material, not an exact match.
+- **Cross-Machine Conflict** — passages referencing a different unit (e.g. M-999 vs M-104) are flagged with cross-unit alert warnings.
 
 ---
 
@@ -112,11 +149,15 @@ Open `http://localhost:8501` in your browser.
 
 ---
 
-## Roadmap
+## Implemented Capabilities
 
-- [x] **Milestone 1:** Core foundation, synthetic incidents CSV, data loader, filtering, unit tests, and dashboard.
-- [x] **Milestone 2:** Evidence ingestion, secure local document storage, TXT/PDF text extraction, catalog metadata, and inspection.
-- [x] **Milestone 3:** Deterministic chunking, persistent SQLite FTS5 indexing, BM25 evidence retrieval, and provenance tracking.
-- [x] **Milestone 4:** Evidence-grounded fault analysis, explainable hypothesis generation, and cross-machine validation.
-- [x] **Milestone 4.1:** Evidence quality and traceability hardening (deduplication, sentence boundaries, scope/context classification).
-- [ ] **Milestone 5:** Future system expansion.
+- [x] Core foundation, synthetic incident dataset, data loader, filtering, and unit tests
+- [x] Interactive Streamlit dashboard with machine filtering and Incident Detail Inspector
+- [x] Evidence ingestion with secure local document storage and TXT/PDF text extraction
+- [x] Deterministic chunking, persistent SQLite FTS5 indexing, and BM25 evidence retrieval
+- [x] Evidence-grounded fault analysis with explainable hypothesis generation
+- [x] Duplicate and near-duplicate evidence detection with provenance preservation
+- [x] Passage quality classification and non-substantive evidence filtering
+- [x] Transparent pipeline metrics and excluded-evidence audit
+- [x] Sentence-bounded snippets, context-aware support reasons, and machine scope discrimination
+- [x] 56 automated tests across incidents, ingestion, retrieval, and analysis
