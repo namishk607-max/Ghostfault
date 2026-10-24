@@ -28,10 +28,18 @@ from src.models import (
     MachineScope,
     PassageQuality,
     EvidenceCounts,
+    RecurrenceScope,
+    EvidenceLinkStatus,
+    IncidentTimelineEntry,
+    SymptomGroup,
+    GroupEvidenceLinkResult,
+    CrossIncidentEvidenceLinkingResult,
 )
 from src.indexer import SearchIndex
 from src.retriever import EvidenceRetriever
 from src.analyzer import FaultAnalysisEngine
+from src.cross_incident import CrossIncidentComparisonEngine, generate_incident_timeline
+from src.evidence_linker import CrossIncidentEvidenceLinker
 
 # Page configuration
 st.set_page_config(
@@ -161,12 +169,14 @@ def get_ingestion_service() -> IngestionService:
 
 
 @st.cache_resource
-def get_search_components() -> tuple[SearchIndex, EvidenceRetriever, FaultAnalysisEngine]:
-    """Initialize and cache the SearchIndex, EvidenceRetriever, and FaultAnalysisEngine instances."""
+def get_search_components() -> tuple[SearchIndex, EvidenceRetriever, FaultAnalysisEngine, CrossIncidentComparisonEngine, CrossIncidentEvidenceLinker]:
+    """Initialize and cache the SearchIndex, EvidenceRetriever, FaultAnalysisEngine, and CrossIncident services."""
     index = SearchIndex()
     retriever = EvidenceRetriever(index)
     analyzer = FaultAnalysisEngine(retriever)
-    return index, retriever, analyzer
+    comparison_engine = CrossIncidentComparisonEngine()
+    evidence_linker = CrossIncidentEvidenceLinker(retriever)
+    return index, retriever, analyzer, comparison_engine, evidence_linker
 
 
 def render_evidence_ingestion(service: IngestionService, search_index: SearchIndex) -> None:
@@ -583,6 +593,242 @@ def render_fault_analysis(analyzer: FaultAnalysisEngine, selected_record: Option
                     st.markdown(f"- ⚠️ {lim}")
 
 
+def render_incident_timeline(df: pd.DataFrame) -> None:
+    """Render Milestone 5.2 Incident Timeline section."""
+    st.subheader("⏱️ Incident Timeline")
+    st.markdown(
+        "Chronological progression of maintenance incidents based on verified incident dates. "
+        "*Note: Chronological proximity or ordering does not establish causation or verified root cause.*"
+    )
+
+    if df.empty:
+        st.info("No incident records available to construct a timeline.")
+        return
+
+    dated_entries, undated_entries, missing_counts = generate_incident_timeline(df)
+
+    t_col1, t_col2, t_col3 = st.columns(3)
+    with t_col1:
+        st.metric("Dated Incidents", len(dated_entries))
+    with t_col2:
+        st.metric("Undated / Unverified Dates", len(undated_entries))
+    with t_col3:
+        if dated_entries:
+            span_text = f"{dated_entries[0].parsed_date} → {dated_entries[-1].parsed_date}"
+        else:
+            span_text = "N/A"
+        st.metric("Temporal Span", span_text)
+
+    # 1. Chronological Timeline Table for Dated Incidents
+    if dated_entries:
+        st.markdown("##### 📅 Chronological Sequence")
+        timeline_rows = []
+        for entry in dated_entries:
+            timeline_rows.append({
+                "Date": entry.parsed_date,
+                "Incident ID": entry.incident_id,
+                "Machine ID": entry.machine_id or "Unassigned",
+                "Reported Symptom": entry.symptom,
+                "Maintenance Action Taken": entry.maintenance_action or "Not recorded",
+                "Outcome / Verification": entry.outcome or "Not recorded",
+            })
+        timeline_df = pd.DataFrame(timeline_rows)
+        st.dataframe(
+            timeline_df,
+            use_container_width=True,
+            column_config={
+                "Date": st.column_config.TextColumn("Date (ISO)", width="small"),
+                "Incident ID": st.column_config.TextColumn("Incident ID", width="small"),
+                "Machine ID": st.column_config.TextColumn("Machine ID", width="small"),
+                "Reported Symptom": st.column_config.TextColumn("Reported Symptom", width="large"),
+                "Maintenance Action Taken": st.column_config.TextColumn("Maintenance Action Taken", width="large"),
+                "Outcome / Verification": st.column_config.TextColumn("Outcome / Verification", width="large"),
+            },
+            hide_index=True,
+        )
+
+    # 2. Undated / Unverified Date Incidents
+    if undated_entries:
+        st.markdown("##### ⚠️ Incidents with Missing or Unverified Dates")
+        st.caption("The following records lack a verified date format and cannot be placed on the chronological timeline without guessing:")
+        undated_rows = []
+        for entry in undated_entries:
+            undated_rows.append({
+                "Incident ID": entry.incident_id,
+                "Machine ID": entry.machine_id or "Unassigned",
+                "Raw Date Value": entry.raw_date or "None / Blank",
+                "Reported Symptom": entry.symptom,
+                "Maintenance Action Taken": entry.maintenance_action or "Not recorded",
+            })
+        undated_df = pd.DataFrame(undated_rows)
+        st.dataframe(
+            undated_df,
+            use_container_width=True,
+            column_config={
+                "Incident ID": st.column_config.TextColumn("Incident ID", width="small"),
+                "Machine ID": st.column_config.TextColumn("Machine ID", width="small"),
+                "Raw Date Value": st.column_config.TextColumn("Raw Date Field", width="medium"),
+                "Reported Symptom": st.column_config.TextColumn("Reported Symptom", width="large"),
+                "Maintenance Action Taken": st.column_config.TextColumn("Maintenance Action Taken", width="large"),
+            },
+            hide_index=True,
+        )
+
+
+def render_cross_incident_analysis(
+    df: pd.DataFrame,
+    comparison_engine: CrossIncidentComparisonEngine,
+    evidence_linker: CrossIncidentEvidenceLinker,
+) -> None:
+    """Render Milestone 5.4 Cross-Incident Comparison & Evidence Linking interface."""
+    st.subheader("🔗 Cross-Incident Comparison & Evidence Grounding")
+    st.markdown(
+        "Deterministic cross-incident pattern comparison and substantive evidence linking. "
+        "Groups matching normalized symptom profiles across maintenance history and connects them to verified "
+        "evidence documentation."
+    )
+
+    # Safety Notice
+    st.info(
+        "⚠️ **Safety Notice:** Evidence links provide context for investigation; they do not prove a common root cause. "
+        "Shared technical guidance or recurring symptoms across different machines must not be assumed to be identical physical failures."
+    )
+
+    if df.empty:
+        st.info("No incident records available to compare for the current filter.")
+        return
+
+    # Deterministic comparison using M5.1 engine
+    comparison_result = comparison_engine.compare_incidents(df)
+
+    # Top-level metrics
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    with m_col1:
+        st.metric("Incidents Compared", comparison_result.total_incidents_analyzed)
+    with m_col2:
+        st.metric("Symptom Groups", len(comparison_result.symptom_groups))
+    with m_col3:
+        recurrent_count = sum(1 for g in comparison_result.symptom_groups if g.recurrence_scope in {RecurrenceScope.SAME_MACHINE, RecurrenceScope.CROSS_MACHINE, RecurrenceScope.MIXED})
+        st.metric("Recurrent Groups", recurrent_count)
+    with m_col4:
+        singleton_count = sum(1 for g in comparison_result.symptom_groups if g.recurrence_scope == RecurrenceScope.SINGLETON)
+        st.metric("Unique / Singleton", singleton_count)
+
+    # Execute M5.3 Evidence Linking
+    link_result = evidence_linker.link_comparison_evidence(comparison_result)
+
+    # Render each symptom group and its evidence links
+    st.markdown("##### 🔍 Symptom Groups & Evidence Links")
+    for group_res in link_result.group_results:
+        # Badge for recurrence scope
+        if group_res.recurrence_scope == RecurrenceScope.SAME_MACHINE:
+            scope_badge = "<span class='badge-scope-exact'>Same Machine Recurrence</span>"
+        elif group_res.recurrence_scope == RecurrenceScope.CROSS_MACHINE:
+            scope_badge = "<span class='badge-scope-cross'>Cross-Machine Recurrence</span>"
+        elif group_res.recurrence_scope == RecurrenceScope.MIXED:
+            scope_badge = "<span class='badge-scope-cross'>Mixed Machine Scope</span>"
+        else:
+            scope_badge = "<span class='badge-scope-general'>Singleton / Isolated</span>"
+
+        # Badge for link status
+        if group_res.status == EvidenceLinkStatus.SUPPORTED:
+            status_badge = "<span class='badge-context-oem'>Supported by Substantive Evidence</span>"
+        elif group_res.status == EvidenceLinkStatus.INSUFFICIENT_SUBSTANTIVE_EVIDENCE:
+            status_badge = "<span class='badge-excluded'>Insufficient Substantive Evidence</span>"
+        else:
+            status_badge = "<span class='badge-scope-general'>No Supporting Evidence Found</span>"
+
+        with st.container(border=True):
+            header_col1, header_col2 = st.columns([3, 2])
+            with header_col1:
+                st.markdown(f"**Symptom Group:** {group_res.canonical_label}")
+                st.caption(f"Group ID: `{group_res.group_id}` | Normalized Key: `{group_res.normalized_symptom}`")
+            with header_col2:
+                st.markdown(f"{scope_badge} &nbsp; {status_badge}", unsafe_allow_html=True)
+                st.caption(f"Related Incidents ({len(group_res.incident_ids)}): `{'`, `'.join(group_res.incident_ids)}`")
+
+            # Evidence linking details
+            if group_res.supporting_evidence:
+                st.markdown(f"**Verified Evidence Passages ({len(group_res.supporting_evidence)} substantive):**")
+                for ev in group_res.supporting_evidence:
+                    with st.container(border=True):
+                        ev_c1, ev_c2 = st.columns([3, 1])
+                        with ev_c1:
+                            st.markdown(f"**Source Document:** `{ev.source_filename}` (`{ev.document_id}`)")
+                            st.caption(f"Chunk ID: `{ev.chunk_id}` | Chunk #{ev.chunk_index}")
+                        with ev_c2:
+                            if ev.retrieval_score is not None:
+                                st.markdown(f"**Score:** `{ev.retrieval_score:.2f}`")
+
+                        # Machine scope badge
+                        if ev.machine_scope == MachineScope.EXACT_MACHINE:
+                            mach_badge = f"<span class='badge-scope-exact'>Exact Machine ({ev.referenced_machine_id})</span>"
+                        elif ev.machine_scope == MachineScope.CROSS_MACHINE_CONFLICT:
+                            mach_badge = f"<span class='badge-scope-cross'>Cross-Machine Conflict ({ev.referenced_machine_id})</span>"
+                        else:
+                            mach_badge = "<span class='badge-scope-general'>General Technical Reference</span>"
+
+                        # Context badge
+                        if ev.context_type == EvidenceContextType.ILLUSTRATIVE_TEST_VALUE:
+                            ctx_badge = "<span class='badge-context-illustrative'>Illustrative Test Value</span>"
+                        elif ev.context_type == EvidenceContextType.VERIFIED_OEM_LIMIT:
+                            ctx_badge = "<span class='badge-context-oem'>Verified OEM Limit</span>"
+                        else:
+                            ctx_badge = "<span class='badge-scope-general'>General Reference</span>"
+
+                        st.markdown(f"{mach_badge} &nbsp; {ctx_badge}", unsafe_allow_html=True)
+                        st.markdown(f"> {ev.snippet}")
+                        st.caption(f"ℹ️ **Relevance Reason:** {ev.relevance_reason}")
+                        st.caption(f"🔗 **Link Explanation:** {ev.link_explanation}")
+
+                        if ev.matched_query_terms:
+                            st.caption(f"**Matched Query Terms:** `{'`, `'.join(ev.matched_query_terms)}`")
+
+                        # Duplicate source copies audit
+                        if ev.duplicate_source_copies:
+                            with st.expander(f"Audited Duplicate Source Copies ({len(ev.duplicate_source_copies)})"):
+                                for dup in ev.duplicate_source_copies:
+                                    st.markdown(
+                                        f"- Document ID: `{dup.get('document_id')}` | File: `{dup.get('source_filename')}` | "
+                                        f"Chunk #{dup.get('chunk_index')} (`{dup.get('chunk_id')}`)"
+                                    )
+
+                        # Provenance limitations
+                        if ev.provenance_limitations:
+                            for plim in ev.provenance_limitations:
+                                st.caption(f"⚠️ *Provenance Note:* {plim}")
+
+            elif group_res.status == EvidenceLinkStatus.INSUFFICIENT_SUBSTANTIVE_EVIDENCE:
+                st.warning(
+                    "All retrieved passages for this symptom group consisted exclusively of search-term lists or "
+                    "administrative document headers and were excluded from substantive link support."
+                )
+            else:
+                st.info(
+                    f"No substantive maintenance evidence was found in the local index matching query terms: `{group_res.query_used}`. "
+                    "This indicates an evidence gap in the local documentation, not proof that a fault does not exist."
+                )
+
+            # Excluded evidence drawer if any
+            if group_res.excluded_evidence:
+                with st.expander(f"Excluded Low-Value or Metadata Passages ({len(group_res.excluded_evidence)})"):
+                    for exc in group_res.excluded_evidence:
+                        st.markdown(f"**Excluded Document:** `{exc.source_filename}` (`{exc.document_id}`)")
+                        st.markdown(f"> {exc.snippet}")
+                        st.caption(f"⚠️ Reason: Non-substantive passage ({exc.quality.value})")
+
+    # Global Limitations Drawer
+    if link_result.global_limitations or comparison_result.limitations:
+        with st.expander("Analytical Boundaries & Data Quality Limitations"):
+            st.markdown("**Comparison & Temporal Limitations:**")
+            for lim in comparison_result.limitations:
+                st.markdown(f"- ⚠️ **{lim.code}:** {lim.description}")
+            st.markdown("---")
+            st.markdown("**Evidence Linking Boundaries:**")
+            for glim in link_result.global_limitations:
+                st.markdown(f"- ⚠️ **{glim.code}:** {glim.description}")
+
+
 def main() -> None:
     st.markdown('<div class="ghost-title">GhostFault</div>', unsafe_allow_html=True)
     st.markdown(
@@ -686,10 +932,18 @@ def main() -> None:
     else:
         st.info("No incident available for the selected filter.")
 
+    ingestion_service = get_ingestion_service()
+    search_index, retriever, analyzer, comparison_engine, evidence_linker = get_search_components()
+
+    # Milestone 5.2: Incident Timeline
+    render_incident_timeline(filtered_df)
+
     st.markdown("---")
 
-    ingestion_service = get_ingestion_service()
-    search_index, retriever, analyzer = get_search_components()
+    # Milestone 5.4: Cross-Incident Comparison & Evidence Linking
+    render_cross_incident_analysis(filtered_df, comparison_engine, evidence_linker)
+
+    st.markdown("---")
 
     # Milestone 4.1.2: Evidence-Grounded Fault Analysis
     render_fault_analysis(analyzer, selected_record)

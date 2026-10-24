@@ -34,12 +34,16 @@ Ghostvault/
 │   ├── chunker.py           # Deterministic text chunker with natural boundaries & offsets
 │   ├── indexer.py           # Persistent SQLite FTS5 index manager with change tracking
 │   ├── retriever.py         # Deterministic keyword retrieval with BM25 ranking & snippet highlights
-│   └── analyzer.py          # Evidence-grounded fault analysis engine & quality hardening
+│   ├── analyzer.py          # Evidence-grounded fault analysis engine & quality hardening
+│   ├── cross_incident.py    # Cross-incident comparison and recurrence analysis engine
+│   └── evidence_linker.py   # Cross-incident evidence linking service & provenance tracking
 └── tests/
     ├── test_incidents.py    # Unit tests for incident dataset integrity and filtering
     ├── test_ingestion.py    # Unit tests for document ingestion, validation, and extraction
     ├── test_retrieval.py    # Unit tests for chunking, FTS5 indexing, and BM25 retrieval
-    └── test_analysis.py     # Unit tests for fault analysis, deduplication, and quality hardening
+    ├── test_analysis.py     # Unit tests for fault analysis, deduplication, and quality hardening
+    ├── test_cross_incident.py # Unit tests for cross-incident recurrence and comparison
+    └── test_evidence_linker.py # Unit tests for cross-incident evidence linking
 ```
 
 ---
@@ -111,6 +115,29 @@ Ghostvault/
 - **General Reference** — passages without specific machine identifiers are treated as general technical material, not an exact match.
 - **Cross-Machine Conflict** — passages referencing a different unit (e.g. M-999 vs M-104) are flagged with cross-unit alert warnings.
 
+### Cross-Incident Comparison & Recurrence Analysis
+- **Deterministic Symptom Grouping:** Groups exact or equivalent normalized symptom profiles (e.g. compound phrases, equivalent adjectives like `elevated` vs `high`) across incident records.
+- **Broad Keyword Isolation:** Does not conflate incidents simply because they share a broad word (e.g. `bearing temperature` vs `bearing noise` remain distinct).
+- **Recurrence Scope Classification:** Explicitly distinguishes:
+  - `SAME_MACHINE`: Recurrence on the exact same known asset.
+  - `CROSS_MACHINE`: Recurrence spanning two or more distinct assets.
+  - `MIXED` / `UNDETERMINED`: Safely isolates records where machine identifiers are missing.
+- **Timeline-Ready Serialization:** Formats incident timestamps for future timeline displays while preserving raw values and flagging invalid/missing dates.
+- **Strict Limitation Declarations:** Never infers root causes from recurrence alone and explicitly logs data gaps (missing machine IDs, unparseable dates, missing maintenance actions).
+
+### Incident Timeline & Temporal Sequencing
+- **Chronological Ordering:** Deterministically sequences incidents by verified ISO dates (`YYYY-MM-DD`). Ties on identical dates are broken stably by incident ID.
+- **Missing / Invalid Date Segregation:** Isolates unverified or missing date records in an "Incidents with Missing or Unverified Dates" section, preserving raw values without guessing.
+- **Provenance & Field Preservation:** Completely retains incident IDs, machine IDs, original symptom descriptions, maintenance actions, and recorded outcomes.
+- **Safety Boundary:** Explicitly notes that chronological proximity does not establish causation or verified root cause.
+
+### Cross-Incident Evidence Linking
+- **Symptom-Group Grounding:** Connects multi-incident symptom groups to relevant local evidence passages using bounded FTS5 queries derived from canonical symptoms and actions.
+- **Substantive Validation:** Filters out non-substantive passages (search-term lists, indexing headers, fragments) so they never count as substantive link support.
+- **Deduplication & Provenance:** Consolidates identical or near-duplicate passages across document uploads without erasing source document IDs, filenames, or chunk indices.
+- **Guidance vs Equipment Context:** Distinguishes machine-specific inspection records (`EXACT_MACHINE`) from general maintenance guides (`GENERAL_REFERENCE`) and flags illustrative test readings with caution notices.
+- **Causal Safety Boundary:** Explicitly establishes that evidence links provide technical context and mechanism explanations, but do not prove that recurring symptoms across different machines share an identical root cause.
+
 ---
 
 ## Local Setup & Launch Instructions (Windows PowerShell)
@@ -160,4 +187,12 @@ Open `http://localhost:8501` in your browser.
 - [x] Passage quality classification and non-substantive evidence filtering
 - [x] Transparent pipeline metrics and excluded-evidence audit
 - [x] Sentence-bounded snippets, context-aware support reasons, and machine scope discrimination
-- [x] 56 automated tests across incidents, ingestion, retrieval, and analysis
+- [x] Cross-incident comparison and recurrence analysis engine with timeline-ready serialization
+- [x] Incident Timeline with chronological ordering, missing-date segregation, and temporal metrics
+- [x] Cross-incident evidence linking with substantive passage validation and causal safety boundaries
+- [x] Integrated cross-incident dashboard with symptom grouping, evidence links, and safety disclaimers
+- [x] 89 automated tests across incidents, ingestion, retrieval, analysis, comparison, timelines, and evidence linking
+
+
+
+
