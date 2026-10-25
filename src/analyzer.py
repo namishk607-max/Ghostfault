@@ -17,6 +17,8 @@ from src.models import (
     PassageQuality,
     EvidenceContextType,
     MachineScope,
+    VerificationStatus,
+    EvidenceStrength,
     EvidenceCounts,
     current_iso_timestamp,
 )
@@ -279,6 +281,303 @@ def generate_support_reason(
         suffix = ""
 
     return f"{prefix} {rel}{suffix}"
+
+
+def verify_hypothesis_evidence(
+    hypothesis: InvestigativeHypothesis,
+    incident_machine_id: Optional[str] = None,
+    pattern: Optional[Dict[str, Any]] = None,
+) -> Tuple[VerificationStatus, str]:
+    """
+    Deterministic evidence verification for a diagnostic hypothesis (Milestone 6.1).
+    Evaluates retrieved evidence to return exactly one status:
+    - CONTRADICTED: Directly relevant and sufficiently reliable evidence explicitly conflicts with the hypothesis.
+    - SUPPORTED: Relevant evidence provides a clear, traceable reason to consider the hypothesis plausible.
+    - INCONCLUSIVE: Evidence is missing, unrelated, ambiguous, or insufficient.
+    """
+    supporting = hypothesis.supporting_evidence or []
+    contradictory = hypothesis.contradictory_evidence or []
+
+    # Rule 1: No retrieved evidence at all
+    if not supporting and not contradictory:
+        return (
+            VerificationStatus.INCONCLUSIVE,
+            "Inconclusive: No retrieved evidence passages available to substantiate or contradict this hypothesis.",
+        )
+
+    # Rule 2: Explicit contradiction check
+    # Check if contradictory evidence contains substantive passages
+    substantive_contra = [
+        c for c in contradictory
+        if getattr(c, "quality", PassageQuality.SUBSTANTIVE_TECHNICAL) == PassageQuality.SUBSTANTIVE_TECHNICAL
+    ]
+
+    has_direct_conflict = False
+    contra_explanations: List[str] = []
+
+    for c in substantive_contra:
+        scope = getattr(c, "machine_scope", None)
+        text_lower = (c.snippet or "").lower()
+
+        # Check for cross-machine conflict
+        if scope == MachineScope.CROSS_MACHINE_CONFLICT:
+            other_m = getattr(c, "referenced_machine_id", None) or "different machine"
+            has_direct_conflict = True
+            contra_explanations.append(
+                f"Passage explicitly documents failure on {other_m} rather than target machine, conflicting with direct applicability ({c.source_filename} Chunk #{c.chunk_index})."
+            )
+        # Check for explicit operational contradiction or nominal operation
+        elif any(term in text_lower for term in [
+            "within nominal", "operating normally", "no fault detected", "no defect found",
+            "passed inspection", "normal tolerance", "nominal limit", "healthy operation"
+        ]):
+            has_direct_conflict = True
+            contra_explanations.append(
+                f"Passage indicates nominal operation or no defect found, directly conflicting with active fault hypothesis ({c.source_filename} Chunk #{c.chunk_index})."
+            )
+
+    if has_direct_conflict:
+        explanation = "Contradicted: " + "; ".join(contra_explanations)
+        return (VerificationStatus.CONTRADICTED, explanation)
+
+    # Rule 3: Evaluate supporting evidence for genuine substantive corroboration
+    substantive_supp = [
+        s for s in supporting
+        if getattr(s, "quality", PassageQuality.SUBSTANTIVE_TECHNICAL) == PassageQuality.SUBSTANTIVE_TECHNICAL
+    ]
+
+    # Incomplete provenance or zero substantive evidence
+    valid_provenance_supp = [
+        s for s in substantive_supp
+        if s.document_id and s.chunk_id and s.chunk_index is not None and s.source_filename
+    ]
+
+    if not valid_provenance_supp:
+        if supporting and not substantive_supp:
+            return (
+                VerificationStatus.INCONCLUSIVE,
+                "Inconclusive: Retrieved passages consist exclusively of indexing metadata or low-substance excerpts.",
+            )
+        return (
+            VerificationStatus.INCONCLUSIVE,
+            "Inconclusive: Retrieved evidence lacks valid document/chunk provenance required for traceable verification.",
+        )
+
+    # Check for keyword overlap alone vs genuine evidential support
+    # A passage is genuine support if:
+    # 1. It is an exact machine match (scope == EXACT_MACHINE), OR
+    # 2. It contains explicit mechanism/causal grounding related to the pattern, OR
+    # 3. It contains direct diagnostic criteria/maintenance history
+    qualifying_support: List[str] = []
+
+    # Get mechanism terms from pattern if provided
+    mechanism_terms = pattern.get("mechanism_terms", []) if pattern else []
+
+    for s in valid_provenance_supp:
+        snippet_lower = (s.snippet or "").lower()
+        scope = getattr(s, "machine_scope", MachineScope.GENERAL_REFERENCE)
+        ctx = getattr(s, "context_type", EvidenceContextType.GENERAL_REFERENCE)
+
+        # Illustrative test values alone are ambiguous/insufficient for physical confirmation
+        if ctx == EvidenceContextType.ILLUSTRATIVE_TEST_VALUE and len(valid_provenance_supp) == 1:
+            continue
+
+        # Check exact machine corroboration
+        if scope == MachineScope.EXACT_MACHINE:
+            m_label = s.referenced_machine_id or incident_machine_id or "target machine"
+            qualifying_support.append(
+                f"Direct incident/maintenance documentation for {m_label} ({s.source_filename} Chunk #{s.chunk_index})"
+            )
+        # Check mechanism terms match
+        elif mechanism_terms and any(term in snippet_lower for term in mechanism_terms):
+            qualifying_support.append(
+                f"Corroborating technical mechanism documented in {s.source_filename} (Chunk #{s.chunk_index})"
+            )
+        # Check general diagnostic criteria or maintenance history
+        elif any(phrase in snippet_lower for phrase in [
+            "diagnostic guide", "indicates", "failure mode", "root cause", "maintenance history",
+            "wear", "breakdown", "fatigue", "damage", "degraded", "clogged", "misalignment"
+        ]):
+            qualifying_support.append(
+                f"Verified diagnostic guidance in {s.source_filename} (Chunk #{s.chunk_index})"
+            )
+
+    if qualifying_support:
+        # At least one substantive passage provides traceable, genuine support
+        unique_reasons = list(dict.fromkeys(qualifying_support))
+        explanation = "Supported: " + "; ".join(unique_reasons) + "."
+        return (VerificationStatus.SUPPORTED, explanation)
+
+    # If only keyword overlap without mechanism or exact-machine grounding:
+    return (
+        VerificationStatus.INCONCLUSIVE,
+        "Inconclusive: Evidence matches search keywords but lacks specific failure mechanism or machine-specific corroboration.",
+    )
+
+
+def evaluate_evidence_strength(
+    hypothesis: InvestigativeHypothesis,
+    verification_status: VerificationStatus,
+    incident_machine_id: Optional[str] = None,
+) -> Tuple[EvidenceStrength, str]:
+    """
+    Qualitative evidence strength assessment for a diagnostic hypothesis (Milestone 6.2).
+    Returns (EvidenceStrength, explanation).
+    - STRONG: Multiple independent, directly relevant evidence passages support the same hypothesis.
+    - LIMITED: Some relevant evidence exists, but it is incomplete or weakly corroborated.
+    - INSUFFICIENT: Available evidence cannot reasonably establish or contradict the hypothesis.
+
+    Rules:
+    1. Qualitative assessment, not a probability or percentage.
+    2. Repeated or duplicate passages from the same source document do NOT count as independent corroboration.
+    3. Preserves verification status; does not override SUPPORTED, CONTRADICTED, or INCONCLUSIVE.
+    4. If evidence is contradictory or provenance is inadequate, explains that limitation.
+    """
+    supporting = hypothesis.supporting_evidence or []
+    contradictory = hypothesis.contradictory_evidence or []
+
+    # Case 1: Inadequate provenance or contradictory evidence limitations
+    if verification_status == VerificationStatus.CONTRADICTED:
+        return (
+            EvidenceStrength.LIMITED,
+            "Contradictory evidence detected; findings are limited by conflicting records or cross-machine applicability.",
+        )
+
+    if verification_status == VerificationStatus.INCONCLUSIVE:
+        # Check if missing or invalid provenance was the cause
+        has_invalid_provenance = any(
+            not s.document_id or not s.chunk_id or s.chunk_index is None
+            for s in supporting
+        )
+        if has_invalid_provenance:
+            return (
+                EvidenceStrength.INSUFFICIENT,
+                "Evidence strength is insufficient due to incomplete or unverifiable source provenance.",
+            )
+        return (
+            EvidenceStrength.INSUFFICIENT,
+            "Available records provide insufficient evidence to reasonably establish or contradict this hypothesis due to absent or non-diagnostic data.",
+        )
+
+    # Case 2: Verification status is SUPPORTED
+    # Filter to substantive references with valid provenance
+    substantive_supp = [
+        s for s in supporting
+        if getattr(s, "quality", PassageQuality.SUBSTANTIVE_TECHNICAL) == PassageQuality.SUBSTANTIVE_TECHNICAL
+        and not getattr(s, "is_duplicate", False)
+        and s.document_id and s.chunk_id
+    ]
+
+    # Count independent sources (distinct document IDs)
+    distinct_doc_ids = {s.document_id for s in substantive_supp}
+    distinct_filenames = {s.source_filename for s in substantive_supp if s.source_filename}
+
+    # Also count independent substantive chunks across distinct documents or distant sections
+    if len(distinct_doc_ids) >= 2 or len(substantive_supp) >= 2 and len(distinct_filenames) >= 2:
+        return (
+            EvidenceStrength.STRONG,
+            f"Multiple independent, directly relevant evidence passages ({len(distinct_doc_ids)} distinct sources) corroborate this hypothesis without reliance on duplicated passages.",
+        )
+    elif len(substantive_supp) >= 1:
+        # Check if it was multiple chunks from the same single document
+        if len(supporting) > 1 and len(distinct_doc_ids) == 1:
+            return (
+                EvidenceStrength.LIMITED,
+                "Corroborated by a single source document; repeated or adjacent chunks from the same document are not treated as independent multi-source verification.",
+            )
+        return (
+            EvidenceStrength.LIMITED,
+            "Supported by relevant evidence from a single documented source, but lacks independent multi-source corroboration.",
+        )
+
+    return (
+        EvidenceStrength.INSUFFICIENT,
+        "Available evidence provides insufficient technical basis to substantiate this hypothesis.",
+    )
+
+
+def derive_missing_evidence_guidance(
+    hypothesis: InvestigativeHypothesis,
+    incident_record: Dict[str, Any],
+    pattern: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Derives cautious, grounded missing-evidence guidance for a hypothesis (Milestone 6.2).
+    Identifies specific evidence gaps that would help further investigation only when justified
+    by the incident symptoms and available evidence.
+
+    Rules:
+    1. Distinguishes 'not found in the available records' from 'does not exist'.
+    2. Only suggests gaps justified by the actual hypothesis and incident facts.
+    3. If no reliable suggestion can be derived, returns 'No specific evidence gap identified.'
+    """
+    symptom = incident_record.get("symptom", "").lower()
+    maintenance = incident_record.get("maintenance_action", "").lower()
+    combined = f"{symptom} {maintenance}"
+
+    # Analyze based on the hypothesis title / pattern
+    title = hypothesis.title.lower()
+
+    # Look at existing supporting snippets to see what is already documented
+    existing_snippets = " ".join([s.snippet.lower() for s in hypothesis.supporting_evidence or []])
+
+    # 1. Bearing Degradation
+    if "bearing" in title:
+        # Check if temperature measurement over time is missing
+        if "temperature" in combined or "bearing" in combined:
+            if "trend" not in existing_snippets and "temperature log" not in existing_snippets and "over time" not in existing_snippets:
+                return (
+                    "A continuous bearing temperature measurement log over time was not found in the available records; "
+                    "time-series thermal data would help confirm steady-state heating versus friction spikes."
+                )
+        # Check if physical inspection or lubricant lab analysis is documented
+        if "grease" not in existing_snippets and "lubricant" not in existing_snippets:
+            return (
+                "Lubrication condition and physical roller element inspection results were not found in the available records; "
+                "lubricant particulate analysis would assist in confirming mechanical wear."
+            )
+
+    # 2. Coupling Misalignment
+    if "coupling" in title or "misalignment" in title:
+        if "laser alignment" not in existing_snippets and "dial indicator" not in existing_snippets:
+            return (
+                "Shaft laser alignment measurements and elastomer insert physical inspection records were not found in the available records; "
+                "pre- and post-alignment readings would verify angular or parallel offset."
+            )
+
+    # 3. Hydraulic Restriction
+    if "hydraulic" in title or "filter" in title:
+        if "differential pressure" not in existing_snippets and "particle count" not in existing_snippets:
+            return (
+                "Differential pressure (delta-P) indicator logs across the return filter and ISO 4406 fluid cleanliness ratings were not found in the available records; "
+                "continuous circuit pressure trends would establish restriction onset."
+            )
+
+    # 4. Thermal Chiller Fault
+    if "chiller" in title or "cooling" in title or "heat exchanger" in title:
+        if "delta t" not in existing_snippets and "flow rate" not in existing_snippets:
+            return (
+                "Closed-loop coolant supply and return temperature differential (delta-T) and spindle jacket flow rate measurements were not found in the available records; "
+                "coolant thermal logs would confirm heat exchanger fouling."
+            )
+
+    # 5. Optical Scale / Positioning Drift
+    if "scale" in title or "optical" in title or "positioning" in title:
+        if "repeatability" not in existing_snippets and "interferometer" not in existing_snippets:
+            return (
+                "Multi-point positioning repeatability measurement records and optical scanning head inspection logs were not found in the available records; "
+                "laser calibration data would distinguish mechanical backlash from scale contamination."
+            )
+
+    # 6. Pneumatic Valve / Actuator
+    if "pneumatic" in title or "actuator" in title or "valve" in title:
+        if "supply pressure" not in existing_snippets and "bypass leakage" not in existing_snippets:
+            return (
+                "Dynamic pneumatic supply pressure traces during stroke actuation and internal cylinder leakage test data were not found in the available records; "
+                "pressure response logs would isolate valve spool sticking from seal blow-by."
+            )
+
+    return "No specific evidence gap identified."
 
 
 class FaultAnalysisEngine:
@@ -585,16 +884,38 @@ class FaultAnalysisEngine:
                         "for a DIFFERENT machine unit. Extreme caution required before applying to this machine."
                     )
 
-                hypotheses.append(
-                    InvestigativeHypothesis(
-                        title=pattern["title"],
-                        description=pattern["description"],
-                        qualification=qual,
-                        supporting_evidence=deduped_supporting,
-                        contradictory_evidence=deduped_contradictory,
-                        suggested_checks=pattern["suggested_checks"],
-                    )
+                hyp = InvestigativeHypothesis(
+                    title=pattern["title"],
+                    description=pattern["description"],
+                    qualification=qual,
+                    supporting_evidence=deduped_supporting,
+                    contradictory_evidence=deduped_contradictory,
+                    suggested_checks=pattern["suggested_checks"],
                 )
+                status, explanation = verify_hypothesis_evidence(
+                    hyp,
+                    incident_machine_id=machine_id,
+                    pattern=pattern,
+                )
+                hyp.verification_status = status
+                hyp.verification_explanation = explanation
+
+                strength, strength_explanation = evaluate_evidence_strength(
+                    hyp,
+                    verification_status=status,
+                    incident_machine_id=machine_id,
+                )
+                hyp.evidence_strength = strength
+                hyp.evidence_strength_explanation = strength_explanation
+
+                gap_guidance = derive_missing_evidence_guidance(
+                    hyp,
+                    incident_record=incident_record,
+                    pattern=pattern,
+                )
+                hyp.missing_evidence_guidance = gap_guidance
+
+                hypotheses.append(hyp)
 
         supporting_hyp_count = sum(len(h.supporting_evidence) for h in hypotheses)
 

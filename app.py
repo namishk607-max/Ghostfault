@@ -28,6 +28,8 @@ from src.models import (
     MachineScope,
     PassageQuality,
     EvidenceCounts,
+    VerificationStatus,
+    EvidenceStrength,
     RecurrenceScope,
     EvidenceLinkStatus,
     IncidentTimelineEntry,
@@ -155,6 +157,66 @@ st.markdown(
         padding: 2px 6px;
         border-radius: 4px;
         border: 1px solid rgba(239, 68, 68, 0.25);
+    }
+    .badge-verification-supported {
+        display: inline-block;
+        background-color: rgba(34, 197, 94, 0.15);
+        color: #16a34a;
+        font-size: 0.8rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        border: 1px solid rgba(34, 197, 94, 0.4);
+    }
+    .badge-verification-contradicted {
+        display: inline-block;
+        background-color: rgba(239, 68, 68, 0.15);
+        color: #dc2626;
+        font-size: 0.8rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+    .badge-verification-inconclusive {
+        display: inline-block;
+        background-color: rgba(234, 179, 8, 0.15);
+        color: #ca8a04;
+        font-size: 0.8rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        border: 1px solid rgba(234, 179, 8, 0.4);
+    }
+    .badge-strength-strong {
+        display: inline-block;
+        background-color: rgba(16, 185, 129, 0.15);
+        color: #059669;
+        font-size: 0.8rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .badge-strength-limited {
+        display: inline-block;
+        background-color: rgba(245, 158, 11, 0.15);
+        color: #d97706;
+        font-size: 0.8rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        border: 1px solid rgba(245, 158, 11, 0.4);
+    }
+    .badge-strength-insufficient {
+        display: inline-block;
+        background-color: rgba(148, 163, 184, 0.15);
+        color: #64748b;
+        font-size: 0.8rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        border: 1px solid rgba(148, 163, 184, 0.4);
     }
     </style>
     """,
@@ -495,6 +557,42 @@ def render_fault_analysis(analyzer: FaultAnalysisEngine, selected_record: Option
                         st.markdown(f"##### Hypothesis #{idx}: {hyp.title}")
                         st.markdown(f"*{hyp.description}*")
                         st.caption(f"**Qualification:** {hyp.qualification}")
+
+                        # Milestone 6.1: Deterministic Evidence Verification Status
+                        v_status = getattr(hyp, "verification_status", VerificationStatus.INCONCLUSIVE)
+                        v_expl = getattr(hyp, "verification_explanation", "")
+                        if v_status == VerificationStatus.SUPPORTED:
+                            v_badge = '<span class="badge-verification-supported">SUPPORTED</span>'
+                        elif v_status == VerificationStatus.CONTRADICTED:
+                            v_badge = '<span class="badge-verification-contradicted">CONTRADICTED</span>'
+                        else:
+                            v_badge = '<span class="badge-verification-inconclusive">INCONCLUSIVE</span>'
+
+                        # Milestone 6.2: Qualitative Evidence Strength
+                        e_strength = getattr(hyp, "evidence_strength", EvidenceStrength.INSUFFICIENT)
+                        e_strength_expl = getattr(hyp, "evidence_strength_explanation", "")
+                        if e_strength == EvidenceStrength.STRONG:
+                            s_badge = '<span class="badge-strength-strong">STRONG</span>'
+                        elif e_strength == EvidenceStrength.LIMITED:
+                            s_badge = '<span class="badge-strength-limited">LIMITED</span>'
+                        else:
+                            s_badge = '<span class="badge-strength-insufficient">INSUFFICIENT</span>'
+
+                        st.markdown(
+                            f"**Evidence Verification:** {v_badge} &nbsp;|&nbsp; **Evidence Strength:** {s_badge}",
+                            unsafe_allow_html=True,
+                        )
+                        if v_expl:
+                            st.caption(f"ℹ️ **Verification:** {v_expl}")
+                        if e_strength_expl:
+                            st.caption(f"📊 **Strength Assessment:** {e_strength_expl}")
+
+                        # Milestone 6.2: Grounded Missing Evidence Guidance
+                        missing_guidance = getattr(hyp, "missing_evidence_guidance", "No specific evidence gap identified.")
+                        if missing_guidance and missing_guidance != "No specific evidence gap identified.":
+                            st.info(f"🔍 **Missing Evidence Guidance:** {missing_guidance}")
+                        else:
+                            st.caption("🔍 **Missing Evidence Guidance:** No specific evidence gap identified.")
 
                         # Retrieved Supporting References (accurate wording separating incident-specific from general)
                         if hyp.supporting_evidence:

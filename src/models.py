@@ -62,6 +62,30 @@ class MachineScope(str, Enum):
     CROSS_MACHINE_CONFLICT = "cross_machine_conflict"
 
 
+class VerificationStatus(str, Enum):
+    """
+    Status of deterministic evidence verification for a diagnostic hypothesis (Milestone 6.1).
+    - SUPPORTED: Relevant evidence provides a clear, traceable reason to consider the hypothesis plausible.
+    - CONTRADICTED: Directly relevant and sufficiently reliable evidence explicitly conflicts with the hypothesis.
+    - INCONCLUSIVE: Evidence is missing, unrelated, ambiguous, or insufficient.
+    """
+    SUPPORTED = "supported"
+    CONTRADICTED = "contradicted"
+    INCONCLUSIVE = "inconclusive"
+
+
+class EvidenceStrength(str, Enum):
+    """
+    Qualitative evidence strength assessment for a diagnostic hypothesis (Milestone 6.2).
+    - STRONG: Multiple independent, directly relevant evidence passages support the same hypothesis.
+    - LIMITED: Some relevant evidence exists, but it is incomplete or weakly corroborated.
+    - INSUFFICIENT: Available evidence cannot reasonably establish or contradict the hypothesis.
+    """
+    STRONG = "strong"
+    LIMITED = "limited"
+    INSUFFICIENT = "insufficient"
+
+
 @dataclass
 class DocumentMetadata:
     """Structured metadata contract for every ingested document."""
@@ -235,6 +259,11 @@ class InvestigativeHypothesis:
     supporting_evidence: List[EvidenceReference]
     contradictory_evidence: List[EvidenceReference]
     suggested_checks: List[str]
+    verification_status: VerificationStatus = VerificationStatus.INCONCLUSIVE
+    verification_explanation: str = ""
+    evidence_strength: EvidenceStrength = EvidenceStrength.INSUFFICIENT
+    evidence_strength_explanation: str = ""
+    missing_evidence_guidance: str = "No specific evidence gap identified."
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -244,6 +273,19 @@ class InvestigativeHypothesis:
             "supporting_evidence": [e.to_dict() for e in self.supporting_evidence],
             "contradictory_evidence": [e.to_dict() for e in self.contradictory_evidence],
             "suggested_checks": self.suggested_checks,
+            "verification_status": (
+                self.verification_status.value
+                if isinstance(self.verification_status, VerificationStatus)
+                else str(self.verification_status)
+            ),
+            "verification_explanation": self.verification_explanation,
+            "evidence_strength": (
+                self.evidence_strength.value
+                if isinstance(self.evidence_strength, EvidenceStrength)
+                else str(self.evidence_strength)
+            ),
+            "evidence_strength_explanation": self.evidence_strength_explanation,
+            "missing_evidence_guidance": self.missing_evidence_guidance,
         }
 
 

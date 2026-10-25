@@ -14,6 +14,8 @@ from src.models import (
     MachineScope,
     PassageQuality,
     EvidenceCounts,
+    VerificationStatus,
+    EvidenceStrength,
 )
 from src.indexer import SearchIndex
 from src.retriever import EvidenceRetriever
@@ -492,3 +494,36 @@ def test_accurate_pipeline_counts_derivation(tmp_path: Path):
     assert counts.substantive_retained_count == 1
     assert counts.excluded_low_value_count == 1
     assert counts.supporting_hypotheses_count == 1
+
+
+def test_hypotheses_include_verification_status(test_analyzer_setup):
+    """Verify that generated hypotheses include deterministic verification_status and explanation."""
+    engine, _, _ = test_analyzer_setup
+    incident = {
+        "incident_id": "INC-2024-001",
+        "machine_id": "M-104",
+        "date": "2024-01-12",
+        "symptom": "High bearing temperature and abnormal acoustic pitch",
+        "maintenance_action": "Lubricated drive-end roller bearing and retorqued housing bolts",
+        "outcome": "Resolved - Bearing temperature stabilized within nominal 65C operating limit",
+    }
+
+    result = engine.analyze_incident(incident)
+    assert len(result.hypotheses) > 0
+    for hyp in result.hypotheses:
+        assert hyp.verification_status in (
+            VerificationStatus.SUPPORTED,
+            VerificationStatus.CONTRADICTED,
+            VerificationStatus.INCONCLUSIVE,
+        )
+        assert hyp.verification_explanation is not None
+        assert len(hyp.verification_explanation) > 0
+        # In this bearing test, DOC-BEAR01 explicitly targets M-104 and bearing diagnostics
+        if "Bearing" in hyp.title:
+            assert hyp.verification_status == VerificationStatus.SUPPORTED
+            assert "Supported:" in hyp.verification_explanation
+            # M6.2: Evidence Strength & Missing Evidence Guidance
+            assert hyp.evidence_strength in (EvidenceStrength.STRONG, EvidenceStrength.LIMITED)
+            assert len(hyp.evidence_strength_explanation) > 0
+            assert hyp.missing_evidence_guidance is not None
+            assert len(hyp.missing_evidence_guidance) > 0
