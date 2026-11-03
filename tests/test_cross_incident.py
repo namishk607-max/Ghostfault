@@ -5,6 +5,7 @@ import pandas as pd
 from pathlib import Path
 
 from src.models import (
+    DEFAULT_DATASET_ID,
     RecurrenceScope,
     CrossIncidentComparisonResult,
     SymptomGroup,
@@ -384,27 +385,33 @@ def test_timeline_on_real_sample_dataset():
 # Milestone 5.4 Tests: Dashboard Integration & Filtered Grounding
 # ==============================================================================
 
-def test_m54_integration_single_machine_filter_comparison_and_linking():
+def test_m54_integration_single_machine_filter_comparison_and_linking(tmp_path):
     """Verify cross-incident comparison and evidence linking operate cleanly on a filtered machine dataset."""
     from src.data_loader import load_incidents_data, filter_by_machine
     from src.indexer import SearchIndex
     from src.retriever import EvidenceRetriever
     from src.evidence_linker import CrossIncidentEvidenceLinker
+    from src.storage import EvidenceStore
 
     df = load_incidents_data()
     m104_df = filter_by_machine(df, "M-104")
     assert len(m104_df) == 3
 
-    comp_engine = CrossIncidentComparisonEngine()
+    store = EvidenceStore(base_dir=tmp_path / "evidence")
+    store.ensure_default_dataset()
+    comp_engine = CrossIncidentComparisonEngine(store=store)
     comp_result = comp_engine.compare_incidents(m104_df)
 
     assert comp_result.total_incidents_analyzed == 3
     assert len(comp_result.compared_incident_ids) == 3
     assert all(entry.machine_id == "M-104" for entry in comp_result.timeline_entries)
 
-    retriever = EvidenceRetriever(SearchIndex())
+    retriever = EvidenceRetriever(SearchIndex(db_path=tmp_path / "empty_index.db"), store)
     linker = CrossIncidentEvidenceLinker(retriever)
-    link_result = linker.link_comparison_evidence(comp_result)
+    link_result = linker.link_comparison_evidence(
+        comp_result,
+        dataset_id=DEFAULT_DATASET_ID,
+    )
 
     assert link_result.total_groups_evaluated == len(comp_result.symptom_groups)
     assert len(link_result.group_results) == 3
@@ -412,11 +419,13 @@ def test_m54_integration_single_machine_filter_comparison_and_linking():
     assert any(lim.code == "NO_SHARED_ROOT_CAUSE" for lim in link_result.global_limitations)
 
 
-def test_m54_integration_empty_filtered_incidents():
+def test_m54_integration_empty_filtered_incidents(tmp_path):
     """Verify cross-incident comparison and linking handle empty filtered dataframe without exceptions."""
     from src.indexer import SearchIndex
     from src.retriever import EvidenceRetriever
     from src.evidence_linker import CrossIncidentEvidenceLinker
+    from src.storage import EvidenceStore
+    from src.models import DEFAULT_DATASET_ID
 
     empty_df = pd.DataFrame(columns=["incident_id", "machine_id", "date", "symptom", "maintenance_action", "outcome"])
     comp_engine = CrossIncidentComparisonEngine()
@@ -425,11 +434,14 @@ def test_m54_integration_empty_filtered_incidents():
     assert comp_result.total_incidents_analyzed == 0
     assert len(comp_result.symptom_groups) == 0
 
-    retriever = EvidenceRetriever(SearchIndex())
+    store = EvidenceStore(base_dir=tmp_path / "evidence")
+    store.ensure_default_dataset()
+    retriever = EvidenceRetriever(SearchIndex(db_path=tmp_path / "empty_index.db"), store)
     linker = CrossIncidentEvidenceLinker(retriever)
-    link_result = linker.link_comparison_evidence(comp_result)
+    link_result = linker.link_comparison_evidence(
+        comp_result,
+        dataset_id=DEFAULT_DATASET_ID,
+    )
 
     assert link_result.total_groups_evaluated == 0
     assert len(link_result.group_results) == 0
-
-

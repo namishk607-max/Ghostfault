@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from src.models import (
+    DEFAULT_DATASET_ID,
     DocumentMetadata,
     DocumentStatus,
     AnalysisStatus,
@@ -19,6 +20,7 @@ from src.models import (
 )
 from src.indexer import SearchIndex
 from src.retriever import EvidenceRetriever
+from src.storage import EvidenceStore
 from src.analyzer import (
     FaultAnalysisEngine,
     extract_sentence_bounded_snippet,
@@ -43,6 +45,7 @@ def make_doc_meta(doc_id: str, filename: str) -> DocumentMetadata:
         updated_at="2026-10-18T00:00:00+00:00",
         extracted_text_reference=f"extracted/{doc_id}.txt",
         extracted_character_count=100,
+        dataset_id=DEFAULT_DATASET_ID,
     )
 
 
@@ -51,6 +54,8 @@ def test_analyzer_setup(tmp_path: Path):
     """Sets up an isolated SearchIndex, EvidenceRetriever, and FaultAnalysisEngine."""
     db_file = tmp_path / "test_analysis_index.db"
     index = SearchIndex(db_path=db_file)
+    store = EvidenceStore(base_dir=tmp_path / "evidence")
+    store.ensure_default_dataset()
 
     # Ingest document 1: Bearing and acoustic diagnostics for M-104
     doc1 = make_doc_meta("DOC-BEAR01", "bearing_maintenance_guide.txt")
@@ -58,7 +63,8 @@ def test_analyzer_setup(tmp_path: Path):
         "Drive-End Bearing Diagnostic Guide for M-104: High bearing temperature and abnormal acoustic pitch "
         "indicate roller element distress or lubricant breakdown. Check housing bolt torque."
     )
-    index.index_document(doc1, text1)
+    store.add_or_update_metadata(doc1)
+    index.index_document(doc1, text1, store=store)
 
     # Ingest document 2: Hydraulic maintenance bulletin (no machine tag)
     doc2 = make_doc_meta("DOC-HYD01", "hydraulic_bulletin.txt")
@@ -66,7 +72,8 @@ def test_analyzer_setup(tmp_path: Path):
         "Hydraulic Bulletin: Clogged 10-micron return filter cartridge leads to intermittent pressure drop "
         "and cavitation across the primary circuit."
     )
-    index.index_document(doc2, text2)
+    store.add_or_update_metadata(doc2)
+    index.index_document(doc2, text2, store=store)
 
     # Ingest document 3: Vibration report explicitly for a DIFFERENT machine M-999
     doc3 = make_doc_meta("DOC-CROSS01", "cross_unit_vibration.txt")
@@ -74,9 +81,10 @@ def test_analyzer_setup(tmp_path: Path):
         "Special Investigation for M-999: Recurrent harmonic vibration and elastomer coupling insert wear. "
         "Shaft alignment was out of specification."
     )
-    index.index_document(doc3, text3)
+    store.add_or_update_metadata(doc3)
+    index.index_document(doc3, text3, store=store)
 
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store)
     engine = FaultAnalysisEngine(retriever)
     return engine, retriever, index
 
@@ -95,9 +103,10 @@ def test_analysis_valid_incident_bearing(test_analyzer_setup):
         "symptom": "High bearing temperature and abnormal acoustic pitch",
         "maintenance_action": "Lubricated drive-end roller bearing and retorqued housing bolts",
         "outcome": "Resolved - Bearing temperature stabilized within nominal 65C operating limit",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
 
     assert result.status == AnalysisStatus.COMPLETED
     assert result.incident_id == "INC-2024-001"
@@ -124,9 +133,10 @@ def test_evidence_references_resolve_to_actual_results(test_analyzer_setup):
         "symptom": "Intermittent pressure drop across primary hydraulic circuit",
         "maintenance_action": "Replaced clogged 10-micron hydraulic return filter cartridge",
         "outcome": "Resolved - System line pressure restored to stable 210 bar",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     retrieved_chunk_ids = {r.chunk.chunk_id for r in result.retrieved_evidence}
 
     for hyp in result.hypotheses:
@@ -149,9 +159,10 @@ def test_different_machine_identifiers_handled_safely(test_analyzer_setup):
         "symptom": "Recurrent harmonic vibration under peak load",
         "maintenance_action": "Replaced degraded elastomer coupling insert and re-aligned shaft",
         "outcome": "Resolved - Vibration velocity decreased",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
 
     assert len(result.hypotheses) > 0
     hyp = result.hypotheses[0]
@@ -165,7 +176,9 @@ def test_different_machine_identifiers_handled_safely(test_analyzer_setup):
 def test_no_evidence_produces_insufficient_evidence_outcome(tmp_path: Path):
     """Ensure an empty search index produces NO_EVIDENCE outcome without fabricated claims."""
     empty_index = SearchIndex(db_path=tmp_path / "empty.db")
-    retriever = EvidenceRetriever(empty_index)
+    store = EvidenceStore(base_dir=tmp_path / "empty_evidence")
+    store.ensure_default_dataset()
+    retriever = EvidenceRetriever(empty_index, store)
     engine = FaultAnalysisEngine(retriever)
 
     incident = {
@@ -174,9 +187,10 @@ def test_no_evidence_produces_insufficient_evidence_outcome(tmp_path: Path):
         "symptom": "Unseen anomaly in mysterious subsystem",
         "maintenance_action": "Inspected mystery unit",
         "outcome": "Unknown",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == AnalysisStatus.NO_EVIDENCE
     assert len(result.retrieved_evidence) == 0
     assert len(result.hypotheses) == 0
@@ -194,9 +208,10 @@ def test_irrelevant_matches_do_not_become_hypotheses(test_analyzer_setup):
         "symptom": "Pneumatic actuator delayed stroke extension",
         "maintenance_action": "Replaced worn rod wiper seal",
         "outcome": "Resolved",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     assert result.status in (AnalysisStatus.INSUFFICIENT_EVIDENCE, AnalysisStatus.NO_EVIDENCE)
     assert len(result.hypotheses) == 0
 
@@ -223,9 +238,10 @@ def test_no_fabricated_provenance(test_analyzer_setup):
         "symptom": "High bearing temperature and abnormal acoustic pitch",
         "maintenance_action": "Lubricated bearing",
         "outcome": "Resolved",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     assert result.incident_facts["incident_id"] == "INC-2024-001"
     assert result.incident_facts["machine_id"] == "M-104"
 
@@ -355,9 +371,10 @@ def test_missing_machine_id_not_treated_as_match(test_analyzer_setup):
         "symptom": "Intermittent pressure drop across primary hydraulic circuit",
         "maintenance_action": "Replaced clogged 10-micron hydraulic return filter cartridge",
         "outcome": "Resolved",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     assert len(result.hypotheses) > 0
     hyp = result.hypotheses[0]
     for ref in hyp.supporting_evidence:
@@ -391,9 +408,10 @@ def test_hypothesis_tentative_qualification_and_no_unsupported_causes(test_analy
         "symptom": "High bearing temperature and abnormal acoustic pitch",
         "maintenance_action": "Lubricated drive-end roller bearing",
         "outcome": "Resolved",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     for hyp in result.hypotheses:
         assert "symptom" in hyp.qualification.lower()
         assert "not confirm" in hyp.qualification.lower() or "requires" in hyp.qualification.lower()
@@ -434,12 +452,15 @@ def test_substantive_maintenance_passage_accepted():
 def test_no_hypothesis_when_only_search_terms_retrieved(tmp_path: Path):
     """Ensure that if retrieval matches ONLY search-term metadata chunks, NO hypothesis is formed."""
     index = SearchIndex(db_path=tmp_path / "terms_only_index.db")
+    store = EvidenceStore(base_dir=tmp_path / "terms_only_evidence")
+    store.ensure_default_dataset()
     doc = make_doc_meta("DOC-TERMS01", "terms_index.txt")
     # File containing only search term lists
     text = "Search terms: bearing temperature, elevated temperature, roller bearing, abnormal acoustic pitch, lubrication."
-    index.index_document(doc, text)
+    store.add_or_update_metadata(doc)
+    index.index_document(doc, text, store=store)
 
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store)
     engine = FaultAnalysisEngine(retriever)
 
     incident = {
@@ -448,9 +469,10 @@ def test_no_hypothesis_when_only_search_terms_retrieved(tmp_path: Path):
         "symptom": "High bearing temperature and abnormal acoustic pitch",
         "maintenance_action": "Lubricated drive-end roller bearing",
         "outcome": "Resolved",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
 
     # Must be INSUFFICIENT_EVIDENCE with 0 hypotheses
     assert result.status == AnalysisStatus.INSUFFICIENT_EVIDENCE
@@ -464,18 +486,22 @@ def test_no_hypothesis_when_only_search_terms_retrieved(tmp_path: Path):
 def test_accurate_pipeline_counts_derivation(tmp_path: Path):
     """Verify counts accurately derive raw, unique, substantive, excluded, and supporting quantities."""
     index = SearchIndex(db_path=tmp_path / "counts_index.db")
+    store = EvidenceStore(base_dir=tmp_path / "counts_evidence")
+    store.ensure_default_dataset()
 
     # 1. Substantive chunk
     doc1 = make_doc_meta("DOC-S1", "manual1.txt")
     text1 = "High bearing temperature indicates drive-end roller bearing fatigue or severe lubricant oxidation."
-    index.index_document(doc1, text1)
+    store.add_or_update_metadata(doc1)
+    index.index_document(doc1, text1, store=store)
 
     # 2. Search terms chunk
     doc2 = make_doc_meta("DOC-T1", "manual2.txt")
     text2 = "Search terms: bearing temperature, elevated temperature, acoustic pitch."
-    index.index_document(doc2, text2)
+    store.add_or_update_metadata(doc2)
+    index.index_document(doc2, text2, store=store)
 
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store)
     engine = FaultAnalysisEngine(retriever)
 
     incident = {
@@ -484,9 +510,10 @@ def test_accurate_pipeline_counts_derivation(tmp_path: Path):
         "symptom": "High bearing temperature and abnormal acoustic pitch",
         "maintenance_action": "Lubricated drive-end roller bearing",
         "outcome": "Resolved",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     counts = result.evidence_counts
     assert counts is not None
     assert counts.raw_retrieved_count >= 2
@@ -506,9 +533,10 @@ def test_hypotheses_include_verification_status(test_analyzer_setup):
         "symptom": "High bearing temperature and abnormal acoustic pitch",
         "maintenance_action": "Lubricated drive-end roller bearing and retorqued housing bolts",
         "outcome": "Resolved - Bearing temperature stabilized within nominal 65C operating limit",
+        "dataset_id": DEFAULT_DATASET_ID,
     }
 
-    result = engine.analyze_incident(incident)
+    result = engine.analyze_incident(incident, dataset_id=DEFAULT_DATASET_ID)
     assert len(result.hypotheses) > 0
     for hyp in result.hypotheses:
         assert hyp.verification_status in (

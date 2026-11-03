@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from src.models import (
+    DEFAULT_DATASET_ID,
     DocumentMetadata,
     DocumentStatus,
     EvidenceLinkStatus,
@@ -17,6 +18,7 @@ from src.models import (
 )
 from src.indexer import SearchIndex
 from src.retriever import EvidenceRetriever
+from src.storage import EvidenceStore
 from src.cross_incident import CrossIncidentComparisonEngine
 from src.evidence_linker import CrossIncidentEvidenceLinker
 
@@ -35,6 +37,7 @@ def make_doc_meta(doc_id: str, filename: str) -> DocumentMetadata:
         updated_at=current_iso_timestamp(),
         extracted_text_reference=f"extracted/{doc_id}.txt",
         extracted_character_count=100,
+        dataset_id=DEFAULT_DATASET_ID,
     )
 
 
@@ -43,6 +46,8 @@ def evidence_linking_setup(tmp_path: Path):
     """Fixture providing a populated test SearchIndex, EvidenceRetriever, and Linker."""
     db_path = tmp_path / "evidence_linker_test.db"
     index = SearchIndex(db_path=db_path)
+    store = EvidenceStore(base_dir=tmp_path / "evidence")
+    store.ensure_default_dataset()
 
     # Document 1: Bearing Maintenance Reference
     doc1 = make_doc_meta("DOC-BEAR-01", "bearing_maintenance_guide.txt")
@@ -52,7 +57,8 @@ def evidence_linking_setup(tmp_path: Path):
         "High bearing temperature accompanied by abnormal acoustic pitch indicates roller surface fatigue "
         "or inadequate lubrication. Recommended maintenance action: lubricate drive-end roller bearing."
     )
-    index.index_document(doc1, text1)
+    store.add_or_update_metadata(doc1)
+    index.index_document(doc1, text1, store=store)
 
     # Document 2: M-104 Specific Inspection Record
     doc2 = make_doc_meta("DOC-M104-01", "m104_field_report.txt")
@@ -61,7 +67,8 @@ def evidence_linking_setup(tmp_path: Path):
         "During peak load operation, unit M-104 exhibited high bearing temperature and acoustic pitch distress. "
         "Technician retorqued housing bolts and inspected lubricant film."
     )
-    index.index_document(doc2, text2)
+    store.add_or_update_metadata(doc2)
+    index.index_document(doc2, text2, store=store)
 
     # Document 3: Hydraulic Maintenance Reference
     doc3 = make_doc_meta("DOC-HYDR-01", "hydraulic_systems_sop.txt")
@@ -70,14 +77,16 @@ def evidence_linking_setup(tmp_path: Path):
         "A sudden pressure drop across the primary hydraulic circuit typically indicates a clogged return filter. "
         "Action: Replace 10-micron filter cartridge and bleed air from circuit."
     )
-    index.index_document(doc3, text3)
+    store.add_or_update_metadata(doc3)
+    index.index_document(doc3, text3, store=store)
 
     # Document 4: Search-term-only metadata chunk
     doc4 = make_doc_meta("DOC-TERMS-01", "indexing_keywords.txt")
     text4 = "Search terms: bearing temperature, acoustic pitch, roller bearing, lubrication, vibration."
-    index.index_document(doc4, text4)
+    store.add_or_update_metadata(doc4)
+    index.index_document(doc4, text4, store=store)
 
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store)
     linker = CrossIncidentEvidenceLinker(retriever)
     return index, retriever, linker
 
@@ -99,7 +108,7 @@ def test_relevant_passage_links_to_symptom_group(evidence_linking_setup):
         maintenance_actions=[{"incident_id": "INC-2024-001", "maintenance_action": "Lubricated drive-end roller bearing"}],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.SUPPORTED
     assert len(result.supporting_evidence) >= 1
     assert any(ev.document_id == "DOC-BEAR-01" for ev in result.supporting_evidence)
@@ -130,7 +139,7 @@ def test_irrelevant_passages_excluded_and_no_support_when_no_match(evidence_link
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.NO_SUPPORTING_EVIDENCE
     assert len(result.supporting_evidence) == 0
     assert any("No matching evidence passages" in lim or "Evidence links" in lim for lim in result.limitations)
@@ -153,7 +162,7 @@ def test_search_terms_and_metadata_passages_excluded_from_substantive_support(ev
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     # The search-term-only chunk from DOC-TERMS-01 must be in excluded_evidence, NOT supporting_evidence
     supporting_doc_ids = [ev.document_id for ev in result.supporting_evidence]
     assert "DOC-TERMS-01" not in supporting_doc_ids
@@ -181,7 +190,7 @@ def test_preservation_of_document_and_passage_provenance(evidence_linking_setup)
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.SUPPORTED
     link = result.supporting_evidence[0]
     assert link.document_id == "DOC-HYDR-01"
@@ -194,17 +203,21 @@ def test_duplicate_passage_handling_preserves_provenance(tmp_path: Path):
     """Verify duplicate copies of identical passages are grouped under primary link without losing provenance."""
     db_path = tmp_path / "dup_test.db"
     index = SearchIndex(db_path=db_path)
+    store = EvidenceStore(base_dir=tmp_path / "duplicate_evidence")
+    store.ensure_default_dataset()
 
     # Document 1 (TXT)
     doc1 = make_doc_meta("DOC-DUP-01", "spindle_guide.txt")
     text = "Spindle drive thermal overload. Inspect closed-loop glycol chiller circuit and clean radiator fins."
-    index.index_document(doc1, text)
+    store.add_or_update_metadata(doc1)
+    index.index_document(doc1, text, store=store)
 
     # Document 2 (PDF duplicate of identical text)
     doc2 = make_doc_meta("DOC-DUP-02", "spindle_guide.pdf")
-    index.index_document(doc2, text)
+    store.add_or_update_metadata(doc2)
+    index.index_document(doc2, text, store=store)
 
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store)
     linker = CrossIncidentEvidenceLinker(retriever)
 
     group = SymptomGroup(
@@ -220,7 +233,7 @@ def test_duplicate_passage_handling_preserves_provenance(tmp_path: Path):
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.SUPPORTED
     # Should be deduplicated into 1 primary link
     assert len(result.supporting_evidence) == 1
@@ -249,7 +262,7 @@ def test_general_guidance_distinguished_from_incident_specific_evidence(evidence
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.SUPPORTED
 
     scopes = {ev.document_id: ev.machine_scope for ev in result.supporting_evidence}
@@ -263,15 +276,18 @@ def test_illustrative_measurements_caution_flagged(tmp_path: Path):
     """Verify passages containing illustrative/synthetic test values are classified and flagged with caution."""
     db_path = tmp_path / "illustrative_test.db"
     index = SearchIndex(db_path=db_path)
+    store = EvidenceStore(base_dir=tmp_path / "illustrative_evidence")
+    store.ensure_default_dataset()
 
     doc = make_doc_meta("DOC-ILLUST-01", "test_bench_notes.txt")
     text = (
         "Vibration test bench log.\n"
         "Illustrative test data for harmonic vibration under simulated peak load: recorded 8.4 mm/s RMS."
     )
-    index.index_document(doc, text)
+    store.add_or_update_metadata(doc)
+    index.index_document(doc, text, store=store)
 
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store)
     linker = CrossIncidentEvidenceLinker(retriever)
 
     group = SymptomGroup(
@@ -287,7 +303,7 @@ def test_illustrative_measurements_caution_flagged(tmp_path: Path):
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.SUPPORTED
     link = result.supporting_evidence[0]
     assert link.context_type == EvidenceContextType.ILLUSTRATIVE_TEST_VALUE
@@ -298,6 +314,8 @@ def test_unknown_machine_scope_handling(tmp_path: Path):
     """Verify symptom groups with no assigned machine ID classify general evidence as GENERAL_REFERENCE."""
     db_path = tmp_path / "unknown_scope.db"
     index = SearchIndex(db_path=db_path)
+    store = EvidenceStore(base_dir=tmp_path / "unknown_scope_evidence")
+    store.ensure_default_dataset()
 
     doc = make_doc_meta("DOC-GEN-01", "pneumatic_sop.txt")
     text = (
@@ -305,9 +323,10 @@ def test_unknown_machine_scope_handling(tmp_path: Path):
         "Delayed stroke extension is frequently caused by a worn rod wiper seal or internal proportional solenoid defect. "
         "Perform pneumatic pressure decay test across the actuator cylinder barrel."
     )
-    index.index_document(doc, text)
+    store.add_or_update_metadata(doc)
+    index.index_document(doc, text, store=store)
 
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store)
     linker = CrossIncidentEvidenceLinker(retriever)
 
     group = SymptomGroup(
@@ -323,7 +342,7 @@ def test_unknown_machine_scope_handling(tmp_path: Path):
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.SUPPORTED
     link = result.supporting_evidence[0]
     assert link.machine_scope == MachineScope.GENERAL_REFERENCE
@@ -350,7 +369,7 @@ def test_multiple_incidents_in_one_symptom_group(evidence_linking_setup):
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert result.status == EvidenceLinkStatus.SUPPORTED
     for ev in result.supporting_evidence:
         assert set(ev.related_incident_ids) == {"INC-2024-001", "INC-2024-010"}
@@ -373,7 +392,7 @@ def test_evidence_links_do_not_imply_common_root_cause(evidence_linking_setup):
         maintenance_actions=[],
     )
 
-    result = linker.link_symptom_group(group)
+    result = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert any("does not prove common root cause" in ev.link_explanation for ev in result.supporting_evidence)
     assert any("do not establish shared root causes" in lim for lim in result.limitations)
 
@@ -381,7 +400,9 @@ def test_evidence_links_do_not_imply_common_root_cause(evidence_linking_setup):
 def test_empty_comparison_results_and_empty_indexes(tmp_path: Path):
     """Verify empty comparison results and empty search indexes are handled safely without exceptions."""
     empty_index = SearchIndex(db_path=tmp_path / "empty.db")
-    empty_retriever = EvidenceRetriever(empty_index)
+    empty_store = EvidenceStore(base_dir=tmp_path / "empty_evidence")
+    empty_store.ensure_default_dataset()
+    empty_retriever = EvidenceRetriever(empty_index, empty_store)
     linker = CrossIncidentEvidenceLinker(empty_retriever)
 
     # Empty comparison result
@@ -395,7 +416,10 @@ def test_empty_comparison_results_and_empty_indexes(tmp_path: Path):
         limitations=[],
         compared_at=current_iso_timestamp(),
     )
-    result = linker.link_comparison_evidence(empty_comp)
+    result = linker.link_comparison_evidence(
+        empty_comp,
+        dataset_id=DEFAULT_DATASET_ID,
+    )
     assert result.total_groups_evaluated == 0
     assert len(result.group_results) == 0
     assert result.supported_groups_count == 0
@@ -413,23 +437,28 @@ def test_empty_comparison_results_and_empty_indexes(tmp_path: Path):
         original_symptoms=[{"incident_id": "INC-01", "symptom": "Test symptom"}],
         maintenance_actions=[],
     )
-    group_res = linker.link_symptom_group(group)
+    group_res = linker.link_symptom_group(group, dataset_id=DEFAULT_DATASET_ID)
     assert group_res.status == EvidenceLinkStatus.NO_SUPPORTING_EVIDENCE
     assert len(group_res.supporting_evidence) == 0
 
 
-def test_link_comparison_evidence_against_real_sample_dataset():
-    """Verify full comparison evidence linking workflow on genuine sample dataset and real search index."""
+def test_link_comparison_evidence_against_sample_incidents(tmp_path: Path):
+    """Verify comparison linking safely handles sample incidents and an isolated local index."""
     from src.data_loader import load_incidents_data
     df = load_incidents_data()
     comp_engine = CrossIncidentComparisonEngine()
     comp_result = comp_engine.compare_incidents(df)
 
-    real_index = SearchIndex()
-    real_retriever = EvidenceRetriever(real_index)
+    isolated_store = EvidenceStore(base_dir=tmp_path / "sample_evidence")
+    isolated_store.ensure_default_dataset()
+    isolated_index = SearchIndex(db_path=tmp_path / "sample_index.db")
+    real_retriever = EvidenceRetriever(isolated_index, isolated_store)
     linker = CrossIncidentEvidenceLinker(real_retriever)
 
-    link_result = linker.link_comparison_evidence(comp_result)
+    link_result = linker.link_comparison_evidence(
+        comp_result,
+        dataset_id=DEFAULT_DATASET_ID,
+    )
     assert link_result.total_groups_evaluated == len(comp_result.symptom_groups)
     assert len(link_result.group_results) == len(comp_result.symptom_groups)
     assert len(link_result.global_limitations) >= 2

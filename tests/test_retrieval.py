@@ -4,7 +4,14 @@ from pathlib import Path
 import pytest
 import sqlite3
 
-from src.models import DocumentMetadata, DocumentStatus, EvidenceChunk, SearchResult
+from src.models import (
+    DEFAULT_DATASET_ID,
+    DocumentMetadata,
+    DocumentStatus,
+    DatasetOwnershipError,
+    EvidenceChunk,
+    SearchResult,
+)
 from src.chunker import TextChunker, compute_content_hash
 from src.storage import EvidenceStore
 from src.indexer import SearchIndex
@@ -24,6 +31,7 @@ def make_test_metadata(doc_id: str = "DOC-TEST01", filename: str = "manual.txt")
         updated_at="2026-10-17T00:00:00+00:00",
         extracted_text_reference=f"extracted/{doc_id}.txt",
         extracted_character_count=100,
+        dataset_id=DEFAULT_DATASET_ID,
     )
 
 
@@ -112,15 +120,22 @@ def temp_index(tmp_path: Path) -> SearchIndex:
 
 @pytest.fixture
 def temp_store(tmp_path: Path) -> EvidenceStore:
-    return EvidenceStore(base_dir=tmp_path / "evidence")
+    store = EvidenceStore(base_dir=tmp_path / "evidence")
+    store.ensure_default_dataset()
+    return store
 
 
-def test_initial_indexing_and_persistence(temp_index: SearchIndex, tmp_path: Path):
+def test_initial_indexing_and_persistence(
+    temp_index: SearchIndex,
+    temp_store: EvidenceStore,
+    tmp_path: Path,
+):
     """Verify initial indexing and persistence across new SearchIndex instance."""
     meta = make_test_metadata(doc_id="DOC-IND01", filename="manual.txt")
     text = "Check acoustic pitch and vibration velocity on motor drive end."
+    temp_store.add_or_update_metadata(meta)
 
-    chunk_count = temp_index.index_document(meta, text)
+    chunk_count = temp_index.index_document(meta, text, store=temp_store)
     assert chunk_count == 1
 
     stats = temp_index.get_index_stats()
@@ -134,13 +149,17 @@ def test_initial_indexing_and_persistence(temp_index: SearchIndex, tmp_path: Pat
     assert reopened_stats["chunk_count"] == 1
 
 
-def test_reindex_unchanged_document_no_duplicates(temp_index: SearchIndex):
+def test_reindex_unchanged_document_no_duplicates(
+    temp_index: SearchIndex,
+    temp_store: EvidenceStore,
+):
     """Verify re-indexing the identical text does not create duplicate chunks."""
     meta = make_test_metadata(doc_id="DOC-DUP01", filename="spec.txt")
     text = "Linear glass scale optical encoder repeatability is verified within 2 microns."
+    temp_store.add_or_update_metadata(meta)
 
-    count1 = temp_index.index_document(meta, text)
-    count2 = temp_index.index_document(meta, text)
+    count1 = temp_index.index_document(meta, text, store=temp_store)
+    count2 = temp_index.index_document(meta, text, store=temp_store)
 
     assert count1 == count2
     stats = temp_index.get_index_stats()
@@ -148,22 +167,35 @@ def test_reindex_unchanged_document_no_duplicates(temp_index: SearchIndex):
     assert stats["chunk_count"] == 1
 
 
-def test_updating_document_replaces_stale_chunks(temp_index: SearchIndex):
+def test_indexing_without_canonical_store_is_rejected(temp_index: SearchIndex):
+    metadata = make_test_metadata(doc_id="DOC-NO-STORE", filename="manual.txt")
+
+    with pytest.raises(DatasetOwnershipError, match="requires an EvidenceStore"):
+        temp_index.index_document(metadata, "Evidence without canonical catalog validation.")
+
+    assert temp_index.get_index_stats()["document_count"] == 0
+
+
+def test_updating_document_replaces_stale_chunks(
+    temp_index: SearchIndex,
+    temp_store: EvidenceStore,
+):
     """Verify modifying text replaces prior chunks cleanly without leaving orphans."""
     meta = make_test_metadata(doc_id="DOC-UPD01", filename="spec.txt")
+    temp_store.add_or_update_metadata(meta)
     text_v1 = "Initial draft: Line pressure threshold is 180 bar."
-    temp_index.index_document(meta, text_v1)
+    temp_index.index_document(meta, text_v1, store=temp_store)
 
     text_v2 = "Revised spec: Line pressure threshold updated to 210 bar nominal."
-    temp_index.index_document(meta, text_v2)
+    temp_index.index_document(meta, text_v2, store=temp_store)
 
     stats = temp_index.get_index_stats()
     assert stats["document_count"] == 1
     assert stats["chunk_count"] == 1
 
-    retriever = EvidenceRetriever(temp_index)
-    results_old = retriever.search("180 bar")
-    results_new = retriever.search("210 bar")
+    retriever = EvidenceRetriever(temp_index, temp_store)
+    results_old = retriever.search("180 bar", dataset_id=DEFAULT_DATASET_ID)
+    results_new = retriever.search("210 bar", dataset_id=DEFAULT_DATASET_ID)
 
     assert len(results_old) == 0
     assert len(results_new) == 1
@@ -175,6 +207,8 @@ def test_rebuild_index_from_store(temp_index: SearchIndex, temp_store: EvidenceS
     # Write 2 synthetic documents to store
     meta1 = make_test_metadata(doc_id="DOC-STORE1", filename="pump.txt")
     meta2 = make_test_metadata(doc_id="DOC-STORE2", filename="chiller.txt")
+    meta1.dataset_id = DEFAULT_DATASET_ID
+    meta2.dataset_id = DEFAULT_DATASET_ID
     temp_store.add_or_update_metadata(meta1)
     temp_store.add_or_update_metadata(meta2)
     temp_store.save_extracted_text(meta1.document_id, "Pump bearing housing retorqued to 45 Nm.")
@@ -194,7 +228,10 @@ def test_rebuild_index_from_store(temp_index: SearchIndex, temp_store: EvidenceS
 # ==============================================================================
 
 @pytest.fixture
-def populated_retriever(temp_index: SearchIndex) -> EvidenceRetriever:
+def populated_retriever(
+    temp_index: SearchIndex,
+    temp_store: EvidenceStore,
+) -> EvidenceRetriever:
     doc1 = make_test_metadata(doc_id="DOC-HYD", filename="hydraulics.txt")
     text1 = (
         "Hydraulic System Bulletin: Excessive pressure drop across the 10-micron return filter. "
@@ -205,19 +242,23 @@ def populated_retriever(temp_index: SearchIndex) -> EvidenceRetriever:
         "Vibration Analysis Report: Recurrent harmonic vibration under peak milling load. "
         "Degraded elastomer coupling insert replaced. Shaft alignment within 0.03 mm."
     )
-    temp_index.index_document(doc1, text1)
-    temp_index.index_document(doc2, text2)
-    return EvidenceRetriever(temp_index)
+    for metadata, text in ((doc1, text1), (doc2, text2)):
+        temp_store.add_or_update_metadata(metadata)
+        temp_index.index_document(metadata, text, store=temp_store)
+    return EvidenceRetriever(temp_index, temp_store)
 
 
 def test_search_single_and_multiple_terms(populated_retriever: EvidenceRetriever):
     """Verify single and multiple keyword retrieval with term matching."""
-    res_single = populated_retriever.search("cavitation")
+    res_single = populated_retriever.search("cavitation", dataset_id=DEFAULT_DATASET_ID)
     assert len(res_single) == 1
     assert res_single[0].chunk.document_id == "DOC-HYD"
     assert "cavitation" in res_single[0].matched_terms
 
-    res_multi = populated_retriever.search("harmonic vibration elastomer")
+    res_multi = populated_retriever.search(
+        "harmonic vibration elastomer",
+        dataset_id=DEFAULT_DATASET_ID,
+    )
     assert len(res_multi) == 1
     assert res_multi[0].chunk.document_id == "DOC-VIB"
     assert "vibration" in res_multi[0].matched_terms
@@ -225,7 +266,11 @@ def test_search_single_and_multiple_terms(populated_retriever: EvidenceRetriever
 
 def test_search_ranking_and_limits(populated_retriever: EvidenceRetriever):
     """Verify result limits and positive BM25 rank score sorting."""
-    results = populated_retriever.search("pressure OR vibration", limit=1)
+    results = populated_retriever.search(
+        "pressure OR vibration",
+        limit=1,
+        dataset_id=DEFAULT_DATASET_ID,
+    )
     assert len(results) <= 1
     if results:
         assert results[0].score > 0
@@ -233,12 +278,15 @@ def test_search_ranking_and_limits(populated_retriever: EvidenceRetriever):
 
 def test_search_empty_and_special_characters(populated_retriever: EvidenceRetriever):
     """Verify queries with empty text, punctuation, or SQL/FTS syntax symbols do not error."""
-    assert populated_retriever.search("") == []
-    assert populated_retriever.search("   ") == []
-    assert populated_retriever.search('""**::??//--') == []
+    assert populated_retriever.search("", dataset_id=DEFAULT_DATASET_ID) == []
+    assert populated_retriever.search("   ", dataset_id=DEFAULT_DATASET_ID) == []
+    assert populated_retriever.search('""**::??//--', dataset_id=DEFAULT_DATASET_ID) == []
 
     # Safe punctuation stripping
-    res = populated_retriever.search("hydraulic, pressure; drop!")
+    res = populated_retriever.search(
+        "hydraulic, pressure; drop!",
+        dataset_id=DEFAULT_DATASET_ID,
+    )
     assert len(res) == 1
     assert res[0].chunk.document_id == "DOC-HYD"
 
@@ -246,11 +294,22 @@ def test_search_empty_and_special_characters(populated_retriever: EvidenceRetrie
 def test_search_document_filter(populated_retriever: EvidenceRetriever):
     """Verify optional document_id filter restricts retrieval results correctly."""
     # Search term 'pressure' is only in DOC-HYD
-    assert len(populated_retriever.search("pressure", document_id_filter="DOC-HYD")) == 1
-    assert len(populated_retriever.search("pressure", document_id_filter="DOC-VIB")) == 0
+    assert len(populated_retriever.search(
+        "pressure",
+        document_id_filter="DOC-HYD",
+        dataset_id=DEFAULT_DATASET_ID,
+    )) == 1
+    assert len(populated_retriever.search(
+        "pressure",
+        document_id_filter="DOC-VIB",
+        dataset_id=DEFAULT_DATASET_ID,
+    )) == 0
 
 
 def test_no_match_returns_empty_list(populated_retriever: EvidenceRetriever):
     """Verify queries with no matching tokens return empty list without fabricating references."""
-    results = populated_retriever.search("quantum teleportation superconductor")
+    results = populated_retriever.search(
+        "quantum teleportation superconductor",
+        dataset_id=DEFAULT_DATASET_ID,
+    )
     assert results == []

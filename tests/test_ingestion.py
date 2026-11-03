@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import pypdf
 
-from src.models import DocumentStatus, ErrorCode, DocumentMetadata
+from src.models import DEFAULT_DATASET_ID, DocumentStatus, ErrorCode, DocumentMetadata
 from src.extractor import TextExtractor
 from src.storage import EvidenceStore
 from src.ingestion import IngestionService
@@ -51,13 +51,14 @@ def temp_store(tmp_path: Path) -> EvidenceStore:
 @pytest.fixture
 def ingestion_service(temp_store: EvidenceStore) -> IngestionService:
     """Fixture providing an IngestionService configured with temporary storage."""
+    temp_store.ensure_default_dataset()
     return IngestionService(store=temp_store)
 
 
 def test_valid_txt_ingestion(ingestion_service: IngestionService, temp_store: EvidenceStore):
     """Test successful ingestion of a valid plain text document."""
     content = "Pump bearing lubrication procedure: inspect oil viscosity every 500 hours.".encode("utf-8")
-    meta = ingestion_service.ingest_document("manual_notes.txt", content)
+    meta = ingestion_service.ingest_document("manual_notes.txt", content, dataset_id=DEFAULT_DATASET_ID)
 
     assert meta.ingestion_status == DocumentStatus.PROCESSED
     assert meta.extraction_status == "success"
@@ -75,7 +76,7 @@ def test_valid_txt_ingestion(ingestion_service: IngestionService, temp_store: Ev
 def test_valid_pdf_ingestion(ingestion_service: IngestionService, temp_store: EvidenceStore):
     """Test successful ingestion and text extraction of a valid PDF document."""
     pdf_bytes = create_sample_pdf("Hydraulic line pressure threshold is 210 bar.")
-    meta = ingestion_service.ingest_document("hydraulic_spec.pdf", pdf_bytes)
+    meta = ingestion_service.ingest_document("hydraulic_spec.pdf", pdf_bytes, dataset_id=DEFAULT_DATASET_ID)
 
     assert meta.ingestion_status == DocumentStatus.PROCESSED
     assert meta.extraction_status == "success"
@@ -89,7 +90,7 @@ def test_valid_pdf_ingestion(ingestion_service: IngestionService, temp_store: Ev
 
 def test_empty_txt_file(ingestion_service: IngestionService):
     """Test that empty TXT files are rejected with ERR_EMPTY_FILE."""
-    meta = ingestion_service.ingest_document("empty.txt", b"")
+    meta = ingestion_service.ingest_document("empty.txt", b"", dataset_id=DEFAULT_DATASET_ID)
 
     assert meta.ingestion_status == DocumentStatus.FAILED
     assert meta.error_code == ErrorCode.EMPTY_FILE.value
@@ -98,7 +99,7 @@ def test_empty_txt_file(ingestion_service: IngestionService):
 
 def test_whitespace_only_txt_file(ingestion_service: IngestionService):
     """Test that whitespace-only TXT files fail with ERR_NO_EXTRACTABLE_TEXT."""
-    meta = ingestion_service.ingest_document("blank.txt", b"   \n\n\t   ")
+    meta = ingestion_service.ingest_document("blank.txt", b"   \n\n\t   ", dataset_id=DEFAULT_DATASET_ID)
 
     assert meta.ingestion_status == DocumentStatus.FAILED
     assert meta.error_code == ErrorCode.NO_EXTRACTABLE_TEXT.value
@@ -108,7 +109,7 @@ def test_whitespace_only_txt_file(ingestion_service: IngestionService):
 def test_invalid_pdf_file(ingestion_service: IngestionService):
     """Test that corrupt/invalid PDF files fail with ERR_INVALID_PDF."""
     corrupt_content = b"Not a real PDF file header"
-    meta = ingestion_service.ingest_document("corrupted.pdf", corrupt_content)
+    meta = ingestion_service.ingest_document("corrupted.pdf", corrupt_content, dataset_id=DEFAULT_DATASET_ID)
 
     assert meta.ingestion_status == DocumentStatus.FAILED
     assert meta.error_code == ErrorCode.INVALID_PDF.value
@@ -118,7 +119,7 @@ def test_invalid_pdf_file(ingestion_service: IngestionService):
 def test_pdf_without_extractable_text(ingestion_service: IngestionService):
     """Test that valid PDFs with no text (e.g. blank or image scan) fail with ERR_NO_EXTRACTABLE_TEXT."""
     blank_pdf = create_empty_pdf()
-    meta = ingestion_service.ingest_document("scanned_manual.pdf", blank_pdf)
+    meta = ingestion_service.ingest_document("scanned_manual.pdf", blank_pdf, dataset_id=DEFAULT_DATASET_ID)
 
     assert meta.ingestion_status == DocumentStatus.FAILED
     assert meta.error_code == ErrorCode.NO_EXTRACTABLE_TEXT.value
@@ -129,7 +130,7 @@ def test_unsupported_file_types(ingestion_service: IngestionService):
     """Test that unsupported extensions are rejected."""
     unsupported = ["data.csv", "image.png", "script.py", "archive.zip"]
     for name in unsupported:
-        meta = ingestion_service.ingest_document(name, b"some content")
+        meta = ingestion_service.ingest_document(name, b"some content", dataset_id=DEFAULT_DATASET_ID)
         assert meta.ingestion_status == DocumentStatus.FAILED
         assert meta.error_code == ErrorCode.UNSUPPORTED_TYPE.value
         assert "unsupported" in meta.error_message.lower()
@@ -140,8 +141,8 @@ def test_duplicate_filenames_receive_unique_ids(ingestion_service: IngestionServ
     content1 = b"First version of maintenance procedure."
     content2 = b"Second distinct version of procedure."
 
-    meta1 = ingestion_service.ingest_document("procedure.txt", content1)
-    meta2 = ingestion_service.ingest_document("procedure.txt", content2)
+    meta1 = ingestion_service.ingest_document("procedure.txt", content1, dataset_id=DEFAULT_DATASET_ID)
+    meta2 = ingestion_service.ingest_document("procedure.txt", content2, dataset_id=DEFAULT_DATASET_ID)
 
     assert meta1.document_id != meta2.document_id
     assert meta1.storage_reference != meta2.storage_reference
@@ -160,7 +161,7 @@ def test_path_traversal_prevention(temp_store: EvidenceStore, ingestion_service:
     malicious_filename = "../../../etc/passwd.txt"
     content = b"Critical diagnostic test note."
 
-    meta = ingestion_service.ingest_document(malicious_filename, content)
+    meta = ingestion_service.ingest_document(malicious_filename, content, dataset_id=DEFAULT_DATASET_ID)
     assert meta.ingestion_status == DocumentStatus.PROCESSED
 
     # Storage file should reside strictly inside temp_store.originals_dir
@@ -173,7 +174,7 @@ def test_path_traversal_prevention(temp_store: EvidenceStore, ingestion_service:
 def test_metadata_persistence_and_retrieval(temp_store: EvidenceStore, ingestion_service: IngestionService):
     """Test that catalog.json correctly persists across new store instances."""
     content = b"Spindle alignment tolerance: 0.005mm."
-    meta = ingestion_service.ingest_document("alignment.txt", content)
+    meta = ingestion_service.ingest_document("alignment.txt", content, dataset_id=DEFAULT_DATASET_ID)
 
     # Instantiate a second store reading the same directory
     reloaded_store = EvidenceStore(base_dir=temp_store.base_dir)
@@ -191,7 +192,7 @@ def test_txt_encoding_fallback(ingestion_service: IngestionService, temp_store: 
     latin1_text = "Régulateur de pression hydraulique: 150 bar."
     encoded_latin1 = latin1_text.encode("latin-1")
 
-    meta = ingestion_service.ingest_document("french_manual.txt", encoded_latin1)
+    meta = ingestion_service.ingest_document("french_manual.txt", encoded_latin1, dataset_id=DEFAULT_DATASET_ID)
     assert meta.ingestion_status == DocumentStatus.PROCESSED
 
     extracted = temp_store.get_extracted_text(meta)

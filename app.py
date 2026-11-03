@@ -6,12 +6,13 @@ Includes:
 - Milestone 2: Evidence document ingestion & management.
 - Milestone 3: Chunking, indexing, and deterministic retrieval.
 - Milestone 4 / 4.1 / 4.1.2: Evidence-grounded fault analysis & substantive relevance validation.
+- Milestone 7.2: Central Intelligence Hub, dataset registry, and navigation.
 """
 
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from src.data_loader import (
     load_incidents_data,
@@ -36,12 +37,103 @@ from src.models import (
     SymptomGroup,
     GroupEvidenceLinkResult,
     CrossIncidentEvidenceLinkingResult,
+    DEFAULT_DATASET_ID,
+    Dataset,
+    DatasetOwnershipError,
 )
 from src.indexer import SearchIndex
 from src.retriever import EvidenceRetriever
 from src.analyzer import FaultAnalysisEngine
 from src.cross_incident import CrossIncidentComparisonEngine, generate_incident_timeline
 from src.evidence_linker import CrossIncidentEvidenceLinker
+from src.hub import (
+    compute_project_summary,
+    compute_dataset_registry,
+    compute_unassociated_counts,
+    compute_incident_overview,
+    compute_evidence_summary,
+    compute_recent_documents,
+    compute_workspace_summary,
+    resolve_active_dataset,
+    set_active_dataset_id,
+    sync_navigation_widget_state,
+    sync_navigation_from_widget,
+    find_invalid_document_associations,
+    find_missing_document_associations,
+    find_invalid_incident_associations,
+    find_missing_incident_associations,
+    create_dataset_entry,
+    get_navigation_page,
+    set_navigation_page,
+    NAVIGATION_PAGES,
+    NAV_HUB,
+    NAV_WORKSPACE,
+    NAV_INCIDENTS,
+    NAV_EVIDENCE_INGESTION,
+    NAV_EVIDENCE_SEARCH,
+    NAV_FAULT_ANALYSIS,
+    NAV_CROSS_INCIDENT,
+)
+
+
+def navigate_to(page: str) -> None:
+    """Set canonical navigation state from a widget callback."""
+    if not set_navigation_page(st.session_state, page, NAVIGATION_PAGES):
+        st.session_state["navigation_error"] = f"Invalid navigation target: {page}"
+
+
+def sync_sidebar_navigation() -> None:
+    """Persist a sidebar radio selection before the app reruns."""
+    if not sync_navigation_from_widget(st.session_state, NAVIGATION_PAGES):
+        st.session_state["navigation_error"] = "The selected navigation page is invalid."
+
+
+def select_active_dataset(widget_key: str, valid_dataset_ids: List[str]) -> None:
+    """Persist a dataset widget selection in the canonical active-dataset state."""
+    success, error = set_active_dataset_id(
+        st.session_state,
+        st.session_state.get(widget_key),
+        valid_dataset_ids,
+    )
+    if not success:
+        st.session_state["active_dataset_error"] = error
+
+
+def open_dataset_workspace(dataset_id: str, valid_dataset_ids: List[str]) -> None:
+    """Select a registered dataset and route to its workspace from a callback."""
+    success, error = set_active_dataset_id(
+        st.session_state,
+        dataset_id,
+        valid_dataset_ids,
+    )
+    if not success:
+        st.session_state["active_dataset_error"] = error
+        return
+    navigate_to(NAV_WORKSPACE)
+
+
+def open_created_dataset_workspace() -> None:
+    """Open the dataset created in the hub after its registry reload."""
+    dataset_id = st.session_state.get("dataset_create_last_id")
+    valid_dataset_ids = st.session_state.get("registered_dataset_ids", [])
+    if not dataset_id:
+        st.session_state["active_dataset_error"] = "No recently created dataset is available."
+        return
+    success, error = set_active_dataset_id(
+        st.session_state,
+        dataset_id,
+        valid_dataset_ids,
+    )
+    if not success:
+        st.session_state["active_dataset_error"] = error
+        return
+    st.session_state.pop("dataset_create_success_msg", None)
+    navigate_to(NAV_WORKSPACE)
+
+
+def migrate_legacy_document_associations(store: EvidenceStore) -> None:
+    """Run the legacy association migration only after an explicit hub action."""
+    st.session_state["legacy_migration_result"] = store.migrate_legacy_data()
 
 # Page configuration
 st.set_page_config(
@@ -234,19 +326,32 @@ def get_ingestion_service() -> IngestionService:
 def get_search_components() -> tuple[SearchIndex, EvidenceRetriever, FaultAnalysisEngine, CrossIncidentComparisonEngine, CrossIncidentEvidenceLinker]:
     """Initialize and cache the SearchIndex, EvidenceRetriever, FaultAnalysisEngine, and CrossIncident services."""
     index = SearchIndex()
-    retriever = EvidenceRetriever(index)
+    retriever = EvidenceRetriever(index, store=EvidenceStore())
     analyzer = FaultAnalysisEngine(retriever)
-    comparison_engine = CrossIncidentComparisonEngine()
+    comparison_engine = CrossIncidentComparisonEngine(store=EvidenceStore())
     evidence_linker = CrossIncidentEvidenceLinker(retriever)
     return index, retriever, analyzer, comparison_engine, evidence_linker
 
 
-def render_evidence_ingestion(service: IngestionService, search_index: SearchIndex) -> None:
+def render_evidence_ingestion(
+    service: IngestionService,
+    search_index: SearchIndex,
+    active_dataset: Optional[Dataset] = None,
+) -> None:
     """Render Milestone 2 Evidence Ingestion interface with auto-indexing."""
     st.subheader("📥 Evidence Ingestion & Document Management")
     st.markdown(
         "Upload technical maintenance manuals, operator logs, or failure sheets (`.pdf`, `.txt`). "
         "Files are validated, stored securely, cataloged, and indexed for deterministic evidence retrieval."
+    )
+
+    if active_dataset is None:
+        st.error("Evidence ingestion requires a registered active dataset.")
+        return
+
+    st.info(
+        f"**Active dataset:** {active_dataset.name} (`{active_dataset.dataset_id}`). "
+        "New uploads will be associated with this workspace."
     )
 
     upload_col, info_col = st.columns([3, 2])
@@ -262,16 +367,22 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
             if st.button("Process & Ingest Document", key="btn_ingest_doc"):
                 with st.spinner(f"Ingesting '{uploaded_file.name}'..."):
                     content_bytes = uploaded_file.getvalue()
+                    target_ds_id = active_dataset.dataset_id
                     meta = service.ingest_document(
                         filename=uploaded_file.name,
                         content=content_bytes,
                         source_type="dashboard_upload",
+                        dataset_id=target_ds_id,
                     )
 
                 if meta.ingestion_status == DocumentStatus.PROCESSED:
                     extracted_text = service.store.get_extracted_text(meta)
                     if extracted_text:
-                        chunks_indexed = search_index.index_document(meta, extracted_text)
+                        chunks_indexed = search_index.index_document(
+                            meta,
+                            extracted_text,
+                            store=service.store,
+                        )
                         st.success(
                             f"✅ Document successfully ingested and indexed! Assigned ID: `{meta.document_id}` "
                             f"({meta.extracted_character_count:,} characters extracted into {chunks_indexed} chunks)."
@@ -298,24 +409,28 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
                 """
             )
 
-    docs = service.list_documents()
-    if docs:
-        st.markdown("#### Cataloged Evidence Documents")
-        
-        tot_docs = len(docs)
-        succ_docs = sum(1 for d in docs if d.ingestion_status == DocumentStatus.PROCESSED)
+    all_docs = service.list_documents()
+    target_ds_id = active_dataset.dataset_id
+    scoped_docs = [d for d in all_docs if d.dataset_id == target_ds_id]
+
+    st.markdown(f"#### 📄 Evidence Documents: **{active_dataset.name}**")
+    st.caption(f"Showing documents cataloged specifically under workspace `{target_ds_id}`.")
+
+    if scoped_docs:
+        tot_docs = len(scoped_docs)
+        succ_docs = sum(1 for d in scoped_docs if d.ingestion_status == DocumentStatus.PROCESSED)
         fail_docs = tot_docs - succ_docs
         
         met_col1, met_col2, met_col3 = st.columns(3)
         with met_col1:
-            st.metric("Total Cataloged Documents", tot_docs)
+            st.metric("Workspace Documents", tot_docs)
         with met_col2:
             st.metric("Successfully Ingested", succ_docs)
         with met_col3:
             st.metric("Failed Ingestions", fail_docs)
 
         catalog_table_data = []
-        for d in docs:
+        for d in scoped_docs:
             catalog_table_data.append({
                 "Document ID": d.document_id,
                 "Original Filename": d.original_filename,
@@ -331,13 +446,13 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
             hide_index=True,
         )
 
-        st.markdown("#### Document Inspector & Text Preview")
-        doc_options = {d.document_id: f"{d.document_id} — {d.original_filename} ({d.ingestion_status.value})" for d in docs}
+        st.markdown("#### Document Inspector & Text Preview (Workspace Scope)")
+        doc_options = {d.document_id: f"{d.document_id} — {d.original_filename} ({d.ingestion_status.value})" for d in scoped_docs}
         selected_doc_id = st.selectbox(
             "Select cataloged document to inspect:",
             options=list(doc_options.keys()),
             format_func=lambda x: doc_options[x],
-            key="doc_inspector_select",
+            key=f"doc_inspector_select_{target_ds_id}",
         )
 
         selected_meta = service.store.get_metadata(selected_doc_id)
@@ -378,15 +493,84 @@ def render_evidence_ingestion(service: IngestionService, search_index: SearchInd
                     else:
                         st.info("No extracted text file found on disk.")
     else:
-        st.info("No documents have been ingested yet. Upload a `.pdf` or `.txt` file above to begin.")
+        st.info(
+            f"No evidence documents have been uploaded to **{active_dataset.name if active_dataset else 'this workspace'}** (`{target_ds_id}`) yet. "
+            "Use the upload form above to add documents to this workspace."
+        )
+
+    # Optional Project-Wide Catalog View
+    if all_docs:
+        with st.expander("🌐 Project-Wide Document Catalog (All Datasets)", expanded=False):
+            st.caption(f"Showing all {len(all_docs)} cataloged documents across all datasets:")
+            pw_table = []
+            for d in all_docs:
+                pw_table.append({
+                    "Document ID": d.document_id,
+                    "Original Filename": d.original_filename,
+                    "Type": d.file_type.upper(),
+                    "Status": d.ingestion_status.value.upper(),
+                    "Dataset ID": d.dataset_id or "Unassociated",
+                    "Extracted Chars": d.extracted_character_count,
+                    "Ingested At (UTC)": d.created_at[:19].replace("T", " "),
+                })
+            st.dataframe(
+                pd.DataFrame(pw_table),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
-def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchIndex, store: EvidenceStore) -> None:
+def render_evidence_search(
+    retriever: EvidenceRetriever,
+    search_index: SearchIndex,
+    store: EvidenceStore,
+    active_dataset: Optional[Dataset] = None,
+) -> None:
     """Render Milestone 3 Evidence Search & Index Management interface."""
     st.subheader("🔎 Evidence Search & Passage Retrieval")
     st.markdown(
         "Query ingested maintenance records, manuals, and technical notes using deterministic keyword search. "
         "Every retrieved passage is ranked using SQLite FTS5 BM25 and includes full provenance tracking back to its source document."
+    )
+    sync_result = st.session_state.pop("index_sync_result", None)
+    if sync_result is not None:
+        if sync_result["errors"]:
+            st.error(
+                f"Index sync completed with {len(sync_result['errors'])} error(s)."
+            )
+            for error in sync_result["errors"]:
+                st.warning(error)
+        else:
+            st.success(
+                f"Synced {sync_result['indexed_documents']} docs "
+                f"({sync_result['total_chunks']} chunks)."
+            )
+        for item in sync_result.get("informational", []):
+            st.info(item["message"])
+
+    rebuild_result = st.session_state.pop("index_rebuild_result", None)
+    if rebuild_result is not None:
+        if rebuild_result["errors"]:
+            st.error(
+                f"Index rebuild completed with {len(rebuild_result['errors'])} error(s)."
+            )
+            for error in rebuild_result["errors"]:
+                st.warning(error)
+        else:
+            st.success(f"Rebuilt index with {rebuild_result['total_chunks']} chunks.")
+        for item in rebuild_result.get("informational", []):
+            st.info(item["message"])
+
+    if active_dataset is None:
+        st.error("Evidence Search requires a registered active dataset. Select a dataset before searching.")
+        return
+
+    st.info(
+        f"**Active dataset:** {active_dataset.name} (`{active_dataset.dataset_id}`). "
+        "Search results are restricted to catalog-owned documents and chunks in this dataset."
+    )
+    st.caption(
+        "Index statistics and Sync/Rebuild actions below cover the project-wide index; search results remain scoped to the active dataset."
     )
 
     stats = search_index.get_index_stats()
@@ -405,16 +589,37 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
             with action_btn_c1:
                 if st.button("🔄 Sync Index", help="Synchronize index with all processed catalog documents"):
                     sync_info = search_index.sync_with_store(store)
-                    st.success(f"Synced {sync_info['indexed_documents']} docs ({sync_info['total_chunks']} chunks).")
+                    st.session_state["index_sync_result"] = sync_info
                     st.rerun()
             with action_btn_c2:
                 if st.button("⚡ Rebuild Index", help="Wipe and rebuild full search index from catalog"):
-                    rebuild_info = search_index.rebuild_index(store)
-                    st.success(f"Rebuilt index with {rebuild_info['total_chunks']} chunks.")
-                    st.rerun()
+                    try:
+                        rebuild_info = search_index.rebuild_index(store)
+                    except DatasetOwnershipError as exc:
+                        st.error(f"Index rebuild was not performed: {exc}")
+                    else:
+                        st.session_state["index_rebuild_result"] = rebuild_info
+                        st.rerun()
+
+    target_ds_id = active_dataset.dataset_id
+    integrity_issues = search_index.validate_dataset_integrity(store, target_ds_id)
+    if integrity_issues:
+        st.error(
+            f"Evidence Search is disabled for this dataset: {len(integrity_issues)} "
+            "catalog/index integrity issue(s) prevent trusting its indexed evidence. "
+            "No ownership was changed. Review the diagnostics and resolve the catalog/index "
+            "mismatch explicitly before searching."
+        )
+        with st.expander("Dataset retrieval integrity diagnostics", expanded=True):
+            for issue in integrity_issues:
+                st.warning(issue.message)
 
     catalog = store.read_catalog()
-    doc_filter_options = ["All Documents"] + [d.document_id for d in catalog if d.ingestion_status == DocumentStatus.PROCESSED]
+    scoped_docs = [
+        d for d in catalog
+        if d.dataset_id == target_ds_id and d.ingestion_status == DocumentStatus.PROCESSED
+    ]
+    doc_filter_options = ["All Documents"] + [d.document_id for d in scoped_docs]
 
     search_col1, search_col2, search_col3 = st.columns([5, 2, 1])
     with search_col1:
@@ -438,13 +643,21 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
         "not diagnostic confidence or probability of machine failure."
     )
 
-    if query.strip():
+    if query.strip() and not integrity_issues:
         with st.spinner("Searching evidence chunks..."):
-            results = retriever.search(
-                query=query,
-                limit=int(max_results),
-                document_id_filter=selected_doc_filter,
-            )
+            all_datasets = store.list_datasets()
+            valid_ids = [d.dataset_id for d in all_datasets]
+            try:
+                results = retriever.search(
+                    query=query,
+                    limit=int(max_results),
+                    document_id_filter=selected_doc_filter,
+                    dataset_id=target_ds_id,
+                    valid_dataset_ids=valid_ids,
+                )
+            except DatasetOwnershipError as exc:
+                st.error(f"Evidence search could not safely return results: {exc}")
+                return
 
         if results:
             st.markdown(f"#### Retrieved Evidence Passages ({len(results)} match{'es' if len(results) > 1 else ''})")
@@ -474,9 +687,15 @@ def render_evidence_search(retriever: EvidenceRetriever, search_index: SearchInd
                     st.markdown(" • ".join(meta_tags))
         else:
             st.info(f"No matching evidence passages found for query: `{query}`. Try different keywords or sync the index.")
+    elif query.strip():
+        st.info("Search was not run because this dataset has unresolved catalog/index integrity issues.")
 
 
-def render_fault_analysis(analyzer: FaultAnalysisEngine, selected_record: Optional[pd.Series]) -> None:
+def render_fault_analysis(
+    analyzer: FaultAnalysisEngine,
+    selected_record: Optional[pd.Series],
+    active_dataset: Optional[Dataset] = None,
+) -> None:
     """Render Milestone 4.1.2 Evidence-Grounded Fault Analysis interface."""
     st.subheader("🧠 Evidence-Grounded Fault Analysis")
     st.markdown(
@@ -485,14 +704,24 @@ def render_fault_analysis(analyzer: FaultAnalysisEngine, selected_record: Option
         "and distinguishes machine scopes with complete provenance traceability."
     )
 
+    if active_dataset is None:
+        st.error("Fault analysis requires a registered active dataset.")
+        return
+
+    st.info(
+        f"**Active dataset:** {active_dataset.name} (`{active_dataset.dataset_id}`). "
+        "Incident ownership and evidence provenance are validated against this dataset."
+    )
+
     if selected_record is None:
         st.info("Please select an incident above to perform fault analysis.")
         return
 
     incident_dict = selected_record.to_dict()
     incident_id = incident_dict.get("incident_id", "UNKNOWN")
+    target_ds_id = active_dataset.dataset_id
 
-    analysis_key = f"analysis_result_{incident_id}"
+    analysis_key = f"analysis_result_{incident_id}_{target_ds_id}"
 
     btn_col, status_col = st.columns([2, 5])
     with btn_col:
@@ -501,7 +730,15 @@ def render_fault_analysis(analyzer: FaultAnalysisEngine, selected_record: Option
     if run_analysis or analysis_key in st.session_state:
         if run_analysis:
             with st.spinner("Analyzing incident symptoms against retrieved evidence corpus..."):
-                analysis_result = analyzer.analyze_incident(incident_dict)
+                try:
+                    analysis_result = analyzer.analyze_incident(
+                        incident_dict,
+                        dataset_id=target_ds_id,
+                    )
+                except DatasetOwnershipError as exc:
+                    st.error(f"Fault analysis was not performed: {exc}")
+                    st.session_state.pop(analysis_key, None)
+                    return
                 st.session_state[analysis_key] = analysis_result
         else:
             analysis_result = st.session_state[analysis_key]
@@ -691,19 +928,29 @@ def render_fault_analysis(analyzer: FaultAnalysisEngine, selected_record: Option
                     st.markdown(f"- ⚠️ {lim}")
 
 
-def render_incident_timeline(df: pd.DataFrame) -> None:
+def render_incident_timeline(
+    df: pd.DataFrame,
+    dataset_id: Optional[str] = None,
+    store: Optional[EvidenceStore] = None,
+) -> None:
     """Render Milestone 5.2 Incident Timeline section."""
     st.subheader("⏱️ Incident Timeline")
     st.markdown(
         "Chronological progression of maintenance incidents based on verified incident dates. "
         "*Note: Chronological proximity or ordering does not establish causation or verified root cause.*"
     )
+    if dataset_id:
+        st.caption(f"Dataset scope: `{dataset_id}`")
 
     if df.empty:
         st.info("No incident records available to construct a timeline.")
         return
 
-    dated_entries, undated_entries, missing_counts = generate_incident_timeline(df)
+    dated_entries, undated_entries, missing_counts = generate_incident_timeline(
+        df,
+        dataset_id=dataset_id,
+        store=store,
+    )
 
     t_col1, t_col2, t_col3 = st.columns(3)
     with t_col1:
@@ -777,6 +1024,7 @@ def render_cross_incident_analysis(
     df: pd.DataFrame,
     comparison_engine: CrossIncidentComparisonEngine,
     evidence_linker: CrossIncidentEvidenceLinker,
+    active_dataset: Optional[Dataset] = None,
 ) -> None:
     """Render Milestone 5.4 Cross-Incident Comparison & Evidence Linking interface."""
     st.subheader("🔗 Cross-Incident Comparison & Evidence Grounding")
@@ -786,6 +1034,15 @@ def render_cross_incident_analysis(
         "evidence documentation."
     )
 
+    if active_dataset is None:
+        st.error("Cross-incident analysis requires a registered active dataset.")
+        return
+
+    st.info(
+        f"**Active dataset:** {active_dataset.name} (`{active_dataset.dataset_id}`). "
+        "Incident comparison, timelines, and evidence links are restricted to this dataset."
+    )
+
     # Safety Notice
     st.info(
         "⚠️ **Safety Notice:** Evidence links provide context for investigation; they do not prove a common root cause. "
@@ -793,11 +1050,20 @@ def render_cross_incident_analysis(
     )
 
     if df.empty:
-        st.info("No incident records available to compare for the current filter.")
+        st.info(
+            f"No incidents are registered in **{active_dataset.name}** "
+            f"(`{active_dataset.dataset_id}`); cross-incident comparison has no records to process."
+        )
         return
 
-    # Deterministic comparison using M5.1 engine
-    comparison_result = comparison_engine.compare_incidents(df)
+    target_ds_id = active_dataset.dataset_id
+
+    # Deterministic comparison using M5.1 engine (scoped to dataset)
+    try:
+        comparison_result = comparison_engine.compare_incidents(df, dataset_id=target_ds_id)
+    except DatasetOwnershipError as exc:
+        st.error(f"Cross-incident comparison was not performed: {exc}")
+        return
 
     # Top-level metrics
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -812,8 +1078,15 @@ def render_cross_incident_analysis(
         singleton_count = sum(1 for g in comparison_result.symptom_groups if g.recurrence_scope == RecurrenceScope.SINGLETON)
         st.metric("Unique / Singleton", singleton_count)
 
-    # Execute M5.3 Evidence Linking
-    link_result = evidence_linker.link_comparison_evidence(comparison_result)
+    # Execute M5.3 Evidence Linking (scoped to dataset)
+    try:
+        link_result = evidence_linker.link_comparison_evidence(
+            comparison_result,
+            dataset_id=target_ds_id,
+        )
+    except DatasetOwnershipError as exc:
+        st.error(f"Cross-incident evidence linking was not performed: {exc}")
+        return
 
     # Render each symptom group and its evidence links
     st.markdown("##### 🔍 Symptom Groups & Evidence Links")
@@ -927,31 +1200,803 @@ def render_cross_incident_analysis(
                 st.markdown(f"- ⚠️ **{glim.code}:** {glim.description}")
 
 
+def render_dataset_workspace(
+    store: EvidenceStore,
+    incidents_df: Optional[pd.DataFrame],
+    active_dataset: Dataset,
+    active_warning: Optional[str] = None,
+) -> None:
+    """Render the Milestone 7.3 Dataset Workspace for the currently selected active dataset."""
+    top_c1, top_c2 = st.columns([4, 1])
+    with top_c1:
+        st.markdown(f"### 📁 Dataset Workspace: **{active_dataset.name}**")
+        st.caption(f"Dataset ID: `{active_dataset.dataset_id}` — Isolated Workspace")
+    with top_c2:
+        st.write("")
+        st.button(
+            "⬅️ Hub Overview",
+            key="ws_top_btn_hub",
+            help="Return to Central Intelligence Hub",
+            use_container_width=True,
+            on_click=navigate_to,
+            args=(NAV_HUB,),
+        )
+
+    st.markdown(
+        "Dedicated workspace for inspecting incidents, evidence documents, and metadata "
+        "associated with the currently active dataset."
+    )
+
+    if active_warning:
+        st.warning(f"⚠️ **Selection Notice:** {active_warning}")
+
+    # Header Card: Active Workspace Identity
+    with st.container(border=True):
+        hdr_c1, hdr_c2 = st.columns([3, 1])
+        with hdr_c1:
+            st.markdown(f"## {active_dataset.name}")
+            st.markdown(
+                f"**Dataset ID:** `{active_dataset.dataset_id}` &nbsp;|&nbsp; "
+                f"<span class='badge-verification-supported'>🟢 ACTIVE WORKSPACE</span>",
+                unsafe_allow_html=True,
+            )
+            if active_dataset.description:
+                st.markdown(f"*{active_dataset.description}*")
+            else:
+                st.caption("No description provided.")
+
+            created_display = (
+                active_dataset.created_at[:19].replace("T", " ")
+                if active_dataset.created_at
+                else "Not recorded"
+            )
+            st.caption(f"📅 **Created (UTC):** {created_display}")
+
+        with hdr_c2:
+            all_datasets = store.list_datasets()
+            ds_ids = [d.dataset_id for d in all_datasets]
+            if len(ds_ids) > 1 and active_dataset.dataset_id in ds_ids:
+                cur_idx = ds_ids.index(active_dataset.dataset_id)
+                st.session_state["workspace_switch_dataset"] = active_dataset.dataset_id
+                st.selectbox(
+                    "Switch Workspace:",
+                    options=ds_ids,
+                    index=cur_idx,
+                    format_func=lambda did: f"{next((d.name for d in all_datasets if d.dataset_id == did), did)}",
+                    key="workspace_switch_dataset",
+                    help="Switch to a different dataset workspace.",
+                    on_change=select_active_dataset,
+                    args=("workspace_switch_dataset", ds_ids),
+                )
+
+    # Workspace Summary Calculations
+    documents = store.read_catalog()
+    ws_summary = compute_workspace_summary(
+        active_dataset.dataset_id,
+        incidents_df,
+        documents,
+    )
+
+    st.markdown("#### 📊 Workspace Overview")
+    w_m1, w_m2, w_m3, w_m4 = st.columns(4)
+    with w_m1:
+        st.metric("Associated Incidents", ws_summary["total_incidents"])
+    with w_m2:
+        st.metric("Evidence Documents", ws_summary["total_documents"])
+    with w_m3:
+        st.metric("Distinct Machines", len(ws_summary["unique_machines"]))
+    with w_m4:
+        chars = ws_summary["total_extracted_characters"]
+        chars_lbl = f"{chars:,}" if chars < 1_000_000 else f"{chars / 1_000_000:.1f}M"
+        st.metric("Extracted Characters", chars_lbl)
+
+    st.markdown("---")
+
+    # Associated Incidents Section
+    st.markdown("#### 📋 Associated Incidents")
+    if ws_summary["total_incidents"] == 0:
+        st.info(
+            f"No maintenance incidents are currently associated with **{active_dataset.name}** "
+            f"(`{active_dataset.dataset_id}`)."
+        )
+    else:
+        st.caption(
+            f"Showing {ws_summary['total_incidents']} incident(s) associated with this dataset:"
+        )
+        inc_df = pd.DataFrame(ws_summary["incidents"])
+        st.dataframe(
+            inc_df[["incident_id", "machine_id", "date", "symptom", "maintenance_action", "outcome"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "incident_id": st.column_config.TextColumn("Incident ID", width="small"),
+                "machine_id": st.column_config.TextColumn("Machine ID", width="small"),
+                "date": st.column_config.TextColumn("Date", width="small"),
+                "symptom": st.column_config.TextColumn("Reported Symptom", width="large"),
+                "maintenance_action": st.column_config.TextColumn("Maintenance Action", width="large"),
+                "outcome": st.column_config.TextColumn("Outcome", width="medium"),
+            },
+        )
+
+        with st.expander("🔍 Inspect Incident Details (Workspace)", expanded=False):
+            available_inc_ids = [inc["incident_id"] for inc in ws_summary["incidents"]]
+            sel_inc_id = st.selectbox(
+                "Select incident to inspect:",
+                options=available_inc_ids,
+                key="ws_incident_inspect_select",
+            )
+            selected_rec = next(
+                (inc for inc in ws_summary["incidents"] if inc["incident_id"] == sel_inc_id),
+                None,
+            )
+            if selected_rec:
+                with st.container(border=True):
+                    sc1, sc2, sc3 = st.columns(3)
+                    with sc1:
+                        st.caption("Incident ID")
+                        st.markdown(f"**`{selected_rec['incident_id']}`**")
+                    with sc2:
+                        st.caption("Machine ID")
+                        st.markdown(f"**`{selected_rec['machine_id']}`**")
+                    with sc3:
+                        st.caption("Date")
+                        st.markdown(f"**{selected_rec['date']}**")
+
+                    st.markdown(f"**Symptom:** {selected_rec['symptom']}")
+                    st.markdown(f"**Maintenance Action:** {selected_rec['maintenance_action']}")
+                    st.markdown(f"**Outcome:** {selected_rec['outcome']}")
+
+                    st.button(
+                        "Open in Incident Management 📋",
+                        key="ws_link_inc_mgmt",
+                        on_click=navigate_to,
+                        args=(NAV_INCIDENTS,),
+                    )
+
+    st.markdown("---")
+
+    # Associated Evidence Documents Section
+    st.markdown("#### 📄 Associated Evidence Documents")
+    if ws_summary["total_documents"] == 0:
+        st.info(
+            f"No evidence documents are currently associated with **{active_dataset.name}** "
+            f"(`{active_dataset.dataset_id}`). "
+            "Navigate to **Evidence Ingestion** to upload maintenance manuals and logs for this dataset."
+        )
+    else:
+        st.caption(
+            f"Showing {ws_summary['total_documents']} document(s) ({ws_summary['processed_documents']} processed, "
+            f"{ws_summary['failed_documents']} failed):"
+        )
+        doc_rows = []
+        for d in ws_summary["documents"]:
+            doc_rows.append({
+                "Document ID": d.document_id,
+                "Original Filename": d.original_filename,
+                "Type": d.file_type.upper() if d.file_type else "UNKNOWN",
+                "Status": d.ingestion_status.value.upper(),
+                "Extracted Chars": d.extracted_character_count,
+                "Ingested At (UTC)": d.created_at[:19].replace("T", " ") if d.created_at else "Unknown",
+            })
+
+        st.dataframe(
+            pd.DataFrame(doc_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("🔍 Inspect Document Text (Workspace)", expanded=False):
+            doc_ids = [d.document_id for d in ws_summary["documents"]]
+            sel_doc_id = st.selectbox(
+                "Select evidence document to preview:",
+                options=doc_ids,
+                format_func=lambda x: f"{x} — {next((d.original_filename for d in ws_summary['documents'] if d.document_id == x), x)}",
+                key="ws_doc_preview_select",
+            )
+            selected_meta = store.get_metadata(sel_doc_id)
+            if selected_meta:
+                with st.container(border=True):
+                    dc1, dc2, dc3 = st.columns(3)
+                    with dc1:
+                        st.caption("Document ID")
+                        st.markdown(f"**`{selected_meta.document_id}`**")
+                    with dc2:
+                        st.caption("Status")
+                        st.markdown(f"**`{selected_meta.ingestion_status.value.upper()}`**")
+                    with dc3:
+                        st.caption("Characters Extracted")
+                        st.markdown(f"**{selected_meta.extracted_character_count:,}**")
+
+                    if selected_meta.error_message:
+                        st.warning(f"Ingestion Error: {selected_meta.error_message}")
+
+                    try:
+                        text_content = store.get_extracted_text(selected_meta)
+                    except Exception:
+                        text_content = None
+
+                    if text_content:
+                        st.caption("Extracted Text Preview:")
+                        preview_len = 2000
+                        val = text_content[:preview_len] + ("\n\n... [Content truncated for preview]" if len(text_content) > preview_len else "")
+                        st.text_area("Content Preview", value=val, height=180, disabled=True, key=f"ws_preview_{sel_doc_id}")
+                    else:
+                        st.info("No extracted text available for this document.")
+
+                    st.button(
+                        "Open in Document Catalog 📥",
+                        key="ws_link_catalog",
+                        on_click=navigate_to,
+                        args=(NAV_EVIDENCE_INGESTION,),
+                    )
+
+    # Data Integrity Warnings
+    all_datasets = store.list_datasets()
+    valid_ids = [d.dataset_id for d in all_datasets]
+    missing_docs = find_missing_document_associations(documents)
+    invalid_docs = find_invalid_document_associations(documents, valid_ids)
+    if missing_docs or invalid_docs:
+        with st.container(border=True):
+            if missing_docs:
+                st.warning(
+                    f"**Unassigned evidence:** {len(missing_docs)} document(s) have no dataset ID. "
+                    "They are not associated with this workspace or with any newly created dataset."
+                )
+            if invalid_docs:
+                st.warning(
+                    f"**Unregistered dataset references:** {len(invalid_docs)} document(s) have a dataset ID "
+                    "that is not present in the registry. These records are left unchanged."
+                )
+
+    st.markdown("---")
+
+    # Scope & Navigation Boundary
+    with st.container(border=True):
+        st.markdown("**ℹ️ Scope & Navigation Boundary**")
+        st.caption(
+            f"You are viewing the workspace for **{active_dataset.name}** (`{active_dataset.dataset_id}`). "
+            "All incident browsing, evidence retrieval, fault analysis, and cross-incident comparisons are strictly isolated to this active dataset."
+        )
+        n1, n2, n3, n4 = st.columns(4)
+        with n1:
+            st.button(
+                "🏠 Central Intelligence Hub",
+                key="ws_nav_btn_hub",
+                use_container_width=True,
+                on_click=navigate_to,
+                args=(NAV_HUB,),
+            )
+        with n2:
+            st.button(
+                "📋 Incident Management",
+                key="ws_nav_btn_inc",
+                use_container_width=True,
+                on_click=navigate_to,
+                args=(NAV_INCIDENTS,),
+            )
+        with n3:
+            st.button(
+                "📥 Evidence Ingestion",
+                key="ws_nav_btn_ingest",
+                use_container_width=True,
+                on_click=navigate_to,
+                args=(NAV_EVIDENCE_INGESTION,),
+            )
+        with n4:
+            st.button(
+                "🔎 Evidence Search",
+                key="ws_nav_btn_search",
+                use_container_width=True,
+                on_click=navigate_to,
+                args=(NAV_EVIDENCE_SEARCH,),
+            )
+
+
+def render_central_hub(
+    store: EvidenceStore,
+    incidents_df: Optional[pd.DataFrame],
+    active_dataset: Optional[Dataset] = None,
+) -> None:
+    """Render the M7.2 Central Intelligence Hub: project overview, dataset registry, and navigation."""
+
+    st.markdown("### 🏠 Central Intelligence Hub")
+    st.markdown(
+        "Project-wide overview of maintenance datasets, incidents, and evidence documents. "
+        "Navigate to detailed investigation features using the sidebar or the quick-access cards below."
+    )
+
+    # --- Gather data from existing sources (read-only) ---
+    store.ensure_default_dataset()
+    datasets = store.list_datasets()
+    documents = store.read_catalog()
+
+    if active_dataset:
+        st.info(
+            f"ℹ️ **Global Hub View:** You are viewing the project-wide Central Intelligence Hub. "
+            f"Active workspace: **{active_dataset.name}** (`{active_dataset.dataset_id}`). "
+            f"To view and investigate records specific only to **{active_dataset.name}**, open its dedicated workspace below."
+        )
+
+    # --- SECTION 1: Project Overview Metrics ---
+    summary = compute_project_summary(datasets, incidents_df, documents)
+    evidence_summary = compute_evidence_summary(documents)
+
+    st.markdown("#### 📊 Project-Wide Statistics")
+    st.caption("Aggregate metrics calculated across all registered maintenance datasets and document catalogs.")
+    m_c1, m_c2, m_c3, m_c4, m_c5 = st.columns(5)
+    with m_c1:
+        st.metric("Datasets", summary["total_datasets"])
+    with m_c2:
+        st.metric("Total Incidents", summary["total_incidents"])
+    with m_c3:
+        st.metric("Evidence Documents", summary["total_documents"])
+    with m_c4:
+        st.metric("Unique Machines", summary["unique_machines"])
+    with m_c5:
+        st.metric("Unique Symptoms", summary["unique_symptoms"])
+
+    with st.container(border=True):
+        ev_c1, ev_c2, ev_c3, ev_c4 = st.columns(4)
+        with ev_c1:
+            st.metric("Processed Documents", evidence_summary["processed_documents"])
+        with ev_c2:
+            st.metric("Failed Ingestions", evidence_summary["failed_documents"])
+        with ev_c3:
+            chars = evidence_summary["total_extracted_characters"]
+            chars_label = f"{chars:,}" if chars < 1_000_000 else f"{chars / 1_000_000:.1f}M"
+            st.metric("Extracted Characters", chars_label)
+        with ev_c4:
+            type_str = ", ".join(
+                f"{k}: {v}" for k, v in sorted(evidence_summary["type_counts"].items())
+            ) if evidence_summary["type_counts"] else "None"
+            st.metric("Document Types", type_str)
+
+    st.markdown("---")
+
+    # --- SECTION 2: Dataset Registry ---
+    st.markdown("#### 📁 Dataset Registry")
+    st.caption(
+        "All registered datasets and their associated record counts. "
+        "Select a dataset below to open its dedicated workspace."
+    )
+
+    registry_rows = compute_dataset_registry(datasets, incidents_df, documents)
+
+    if registry_rows:
+        registry_table = []
+        for row in registry_rows:
+            created_display = row["created_at"][:19].replace("T", " ") if row["created_at"] else "Unknown"
+            registry_table.append({
+                "Dataset Name": row["name"],
+                "Dataset ID": row["dataset_id"],
+                "Description": row["description"] or "—",
+                "Created": created_display,
+                "Incidents": row["incident_count"],
+                "Documents": row["document_count"],
+                "Processed Docs": row["processed_document_count"],
+            })
+
+        st.dataframe(
+            pd.DataFrame(registry_table),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Dataset Name": st.column_config.TextColumn("Dataset Name", width="medium"),
+                "Dataset ID": st.column_config.TextColumn("Dataset ID", width="medium"),
+                "Description": st.column_config.TextColumn("Description", width="large"),
+                "Created": st.column_config.TextColumn("Created (UTC)", width="small"),
+                "Incidents": st.column_config.NumberColumn("Incidents", width="small"),
+                "Documents": st.column_config.NumberColumn("Documents", width="small"),
+                "Processed Docs": st.column_config.NumberColumn("Processed", width="small"),
+            },
+        )
+
+        # Milestone 7.3: Open Dataset Workspace action from Registry
+        st.markdown("##### 📁 Open Dataset Workspace")
+        reg_c1, reg_c2 = st.columns([3, 1])
+        with reg_c1:
+            target_open_id = st.selectbox(
+                "Select a dataset workspace to open:",
+                options=[r["dataset_id"] for r in registry_rows],
+                format_func=lambda did: f"{next((r['name'] for r in registry_rows if r['dataset_id'] == did), did)} ({did})",
+                key="hub_open_ws_select",
+                help="Switch active dataset to this selection and open its workspace.",
+            )
+        with reg_c2:
+            st.write("")
+            st.button(
+                "Open Workspace ➡️",
+                key="hub_btn_open_ws",
+                use_container_width=True,
+                on_click=open_dataset_workspace,
+                args=(target_open_id, [d.dataset_id for d in datasets]),
+            )
+
+        # Milestone 7.4: Create Dataset Form
+        st.markdown("##### ➕ Create New Dataset")
+        with st.expander("Create a new maintenance dataset", expanded=False):
+            candidate_id = store.generate_dataset_id()
+            while store.get_dataset(candidate_id) is not None:
+                candidate_id = store.generate_dataset_id()
+
+            st.caption(f"Unique Dataset ID (Auto-Generated): `{candidate_id}`")
+
+            with st.form("create_dataset_form", clear_on_submit=True):
+                new_name = st.text_input(
+                    "Dataset Name *",
+                    placeholder="e.g. Facility 2 CNC Spindle Logs, Bearing Replacement 2026",
+                    help="Descriptive name for the maintenance dataset (2 to 100 characters).",
+                    key="input_create_dataset_name",
+                )
+                new_desc = st.text_area(
+                    "Description (Optional)",
+                    placeholder="Optional notes regarding the operational scope, machine series, or facility unit...",
+                    help="Optional summary description.",
+                    key="input_create_dataset_desc",
+                )
+                create_btn = st.form_submit_button("Create Dataset ➕", use_container_width=True)
+
+                if create_btn:
+                    success, new_ds, err_msg = create_dataset_entry(
+                        store,
+                        name=new_name,
+                        description=new_desc,
+                        dataset_id=candidate_id,
+                    )
+                    if success and new_ds:
+                        st.session_state["dataset_create_success_msg"] = (
+                            f"Dataset '{new_ds.name}' ({new_ds.dataset_id}) created successfully!"
+                        )
+                        st.session_state["dataset_create_last_id"] = new_ds.dataset_id
+                        st.session_state["dataset_create_last_name"] = new_ds.name
+                        st.rerun()
+                    else:
+                        st.error(f"Validation Error: {err_msg}")
+
+        # Display success banner & offer immediate navigation if newly created
+        if "dataset_create_success_msg" in st.session_state:
+            st.success(f"✅ {st.session_state['dataset_create_success_msg']}")
+            new_id = st.session_state.get("dataset_create_last_id")
+            new_name = st.session_state.get("dataset_create_last_name", new_id)
+            sc1, sc2 = st.columns([3, 1])
+            with sc1:
+                st.caption(f"Ready to investigate **{new_name}** (`{new_id}`).")
+            with sc2:
+                st.button(
+                    f"Open '{new_name}' Workspace ➡️",
+                    key="btn_open_just_created_ws",
+                    use_container_width=True,
+                    on_click=open_created_dataset_workspace,
+                )
+
+    else:
+        st.info("No datasets registered yet. The default dataset will be created automatically when data is loaded.")
+
+    # Keep missing assignments distinct from dangling references; neither is
+    # implicitly attached to the active or newly created dataset.
+    unassociated = compute_unassociated_counts(datasets, incidents_df, documents)
+    missing_docs = find_missing_document_associations(documents)
+    invalid_docs = find_invalid_document_associations(
+        documents,
+        [dataset.dataset_id for dataset in datasets],
+    )
+    invalid_incidents = find_invalid_incident_associations(
+        incidents_df,
+        [dataset.dataset_id for dataset in datasets],
+    )
+    missing_incidents = find_missing_incident_associations(incidents_df)
+    if (
+        unassociated["unassociated_incidents"] > 0
+        or missing_incidents
+        or missing_docs
+        or invalid_docs
+        or invalid_incidents
+    ):
+        with st.container(border=True):
+            st.markdown("#### Data association integrity")
+            if missing_incidents:
+                st.warning(
+                    f"{len(missing_incidents)} incident(s) have no dataset ID."
+                )
+            if missing_docs:
+                st.warning(
+                    f"{len(missing_docs)} evidence document(s) have no dataset ID. "
+                    "These are unassigned legacy records, not documents referencing a nonexistent dataset."
+                )
+                st.caption(
+                    "The legacy migration associates only records with a missing dataset ID to Default Dataset. "
+                    "It does not assign them to the active or newly created dataset, and does not change records "
+                    "that already contain a dataset ID."
+                )
+                confirm_migration = st.checkbox(
+                    "I explicitly approve associating these unassigned legacy documents with Default Dataset.",
+                    key="confirm_legacy_document_migration",
+                )
+                st.button(
+                    f"Associate {len(missing_docs)} unassigned document(s) with Default Dataset",
+                    key="migrate_legacy_documents",
+                    disabled=not confirm_migration,
+                    on_click=migrate_legacy_document_associations,
+                    args=(store,),
+                )
+            if invalid_docs:
+                st.warning(
+                    f"{len(invalid_docs)} document(s) contain a non-empty dataset ID that is not registered. "
+                    "Those references are left unchanged and are not included in the legacy migration."
+                )
+            if invalid_incidents:
+                st.warning(
+                    f"{len(invalid_incidents)} incident(s) contain non-empty dataset IDs that are not registered. "
+                    "Incident source data has not been changed."
+                )
+    migration_result = st.session_state.pop("legacy_migration_result", None)
+    if migration_result:
+        st.success(
+            f"Legacy migration completed: {migration_result['migrated_documents']} document(s) "
+            f"associated with Default Dataset; {migration_result['already_associated_documents']} "
+            "already had an association."
+        )
+
+    st.markdown("---")
+
+    # --- SECTION 3: Incident Overview ---
+    st.markdown("#### 📋 Project-Wide Incidents Overview")
+    overview_rows = compute_incident_overview(incidents_df)
+
+    if overview_rows:
+        st.caption(f"Showing all {len(overview_rows)} incidents across all registered datasets. (To view incidents for a single dataset, open its Dataset Workspace.)")
+        st.dataframe(
+            pd.DataFrame(overview_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Incident ID": st.column_config.TextColumn("Incident ID", width="small"),
+                "Machine ID": st.column_config.TextColumn("Machine ID", width="small"),
+                "Date": st.column_config.TextColumn("Date", width="small"),
+                "Symptom": st.column_config.TextColumn("Reported Symptom", width="large"),
+                "Dataset": st.column_config.TextColumn("Dataset", width="medium"),
+            },
+        )
+
+        st.caption(
+            "💡 **Tip:** To inspect incident details or run fault analysis, navigate to "
+            "**Incident Management** or **Fault Analysis** using the sidebar."
+        )
+    else:
+        st.info("No incident records available. Load incident data to populate this overview.")
+
+    st.markdown("---")
+
+    # --- SECTION 4: Recent Activity ---
+    st.markdown("#### 🕐 Project-Wide Recent Activity")
+
+    recent_docs = compute_recent_documents(documents, limit=5)
+    if recent_docs:
+        st.caption("Most recently ingested evidence documents across the entire project (based on persisted timestamps):")
+        recent_table = []
+        for rd in recent_docs:
+            recent_table.append({
+                "Document ID": rd["document_id"],
+                "Filename": rd["original_filename"],
+                "Type": rd["file_type"],
+                "Status": rd["status"],
+                "Ingested At": rd["created_at"],
+                "Dataset": rd["dataset_id"],
+            })
+        st.dataframe(
+            pd.DataFrame(recent_table),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info(
+            "No evidence documents have been ingested yet. "
+            "Navigate to **Evidence Ingestion** to upload maintenance documents."
+        )
+
+    st.caption(
+        "ℹ️ A comprehensive activity log with investigation history tracking "
+        "is planned for a future milestone. Current activity is limited to persisted document ingestion timestamps."
+    )
+
+    st.markdown("---")
+
+    # --- SECTION 5: Quick Navigation Cards ---
+    st.markdown("#### 🧭 Quick Navigation")
+    st.caption("Jump to specific investigation features:")
+
+    nav_c1, nav_c2, nav_c3 = st.columns(3)
+    with nav_c1:
+        with st.container(border=True):
+            st.markdown("**📁 Dataset Workspace**")
+            ws_label = active_dataset.name if active_dataset else "Selected Dataset"
+            st.caption(f"Inspect records for active workspace: **{ws_label}**.")
+            st.button(
+                "Open Active Workspace",
+                key="hub_nav_ws",
+                on_click=navigate_to,
+                args=(NAV_WORKSPACE,),
+            )
+
+        with st.container(border=True):
+            st.markdown("**📋 Incident Management**")
+            st.caption("Browse, filter, and inspect maintenance incidents.")
+            st.button(
+                "Go to Incidents",
+                key="hub_nav_incidents",
+                on_click=navigate_to,
+                args=(NAV_INCIDENTS,),
+            )
+
+    with nav_c2:
+        with st.container(border=True):
+            st.markdown("**📥 Evidence Ingestion**")
+            st.caption("Upload and process maintenance documents (PDF, TXT).")
+            st.button(
+                "Go to Ingestion",
+                key="hub_nav_ingestion",
+                on_click=navigate_to,
+                args=(NAV_EVIDENCE_INGESTION,),
+            )
+
+        with st.container(border=True):
+            st.markdown("**🔎 Evidence Search**")
+            st.caption("Query the indexed evidence corpus with keyword search.")
+            st.button(
+                "Go to Search",
+                key="hub_nav_search",
+                on_click=navigate_to,
+                args=(NAV_EVIDENCE_SEARCH,),
+            )
+
+    with nav_c3:
+        with st.container(border=True):
+            st.markdown("**🧠 Fault Analysis**")
+            st.caption("Run evidence-grounded fault analysis on selected incidents.")
+            st.button(
+                "Go to Fault Analysis",
+                key="hub_nav_analysis",
+                on_click=navigate_to,
+                args=(NAV_FAULT_ANALYSIS,),
+            )
+
+        with st.container(border=True):
+            st.markdown("**🔗 Cross-Incident Analysis**")
+            st.caption("Compare symptom patterns and evidence links across incidents.")
+            st.button(
+                "Go to Cross-Incident",
+                key="hub_nav_cross",
+                on_click=navigate_to,
+                args=(NAV_CROSS_INCIDENT,),
+            )
+
+    # Scope disclaimer
+    st.caption(
+        "ℹ️ **Project-Wide Scope Notice:** The Central Intelligence Hub shows project-wide aggregate statistics, all registered datasets, and overall activity. "
+        "Individual Dataset Workspaces provide strict dataset-isolated records, evidence retrieval, and fault analysis."
+    )
+
+
 def main() -> None:
     st.markdown('<div class="ghost-title">GhostFault</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="ghost-subtitle">Evidence-first industrial failure intelligence</div>',
         unsafe_allow_html=True,
     )
+    navigation_error = st.session_state.pop("navigation_error", None)
+    if navigation_error:
+        st.error(navigation_error)
+    active_dataset_error = st.session_state.pop("active_dataset_error", None)
+    if active_dataset_error:
+        st.error(active_dataset_error)
+
+    # --- Initialize Components and Storage ---
+    ingestion_service = get_ingestion_service()
+    search_index, retriever, analyzer, comparison_engine, evidence_linker = get_search_components()
+
+    # Ensure default dataset exists and load registry
+    ingestion_service.store.ensure_default_dataset()
+    registered_datasets = ingestion_service.store.list_datasets()
 
     try:
-        raw_df = load_incidents_data()
+        raw_df = load_incidents_data(
+            valid_dataset_ids=[dataset.dataset_id for dataset in registered_datasets]
+        )
     except DatasetLoadError as err:
         st.error(
             f"**Failed to load maintenance records:** {err}\n\n"
-            "Please ensure the data file exists at `data/sample/incidents.csv` and contains all required columns."
+            "Please ensure the data file exists at `data/sample/incidents.csv`, contains all required columns, "
+            "and only references registered datasets."
         )
         st.stop()
 
+    # Milestone 7.3: Active dataset state resolution
+    current_active_id = st.session_state.get("active_dataset_id", DEFAULT_DATASET_ID)
+    active_dataset, resolved_active_id, active_warning = resolve_active_dataset(
+        current_active_id,
+        registered_datasets,
+        default_id=DEFAULT_DATASET_ID,
+    )
+    st.session_state["registered_dataset_ids"] = [
+        dataset.dataset_id for dataset in registered_datasets
+    ]
+    if current_active_id != resolved_active_id:
+        for key in list(st.session_state.keys()):
+            if isinstance(key, str) and key.startswith("analysis_result_"):
+                del st.session_state[key]
+    st.session_state["active_dataset_id"] = resolved_active_id
+    st.session_state["active_dataset_selector_widget"] = resolved_active_id
+
+    # --- Sidebar: Navigation + Controls ---
     with st.sidebar:
-        st.header("Controls & Filters")
-        machine_options = ["All Machines"] + sorted(raw_df["machine_id"].unique().tolist())
-        selected_machine = st.selectbox(
-            "Select Machine ID",
-            options=machine_options,
-            index=0,
-            help="Filter maintenance incidents by specific machine unit.",
+        st.header("Navigation")
+
+        sync_navigation_widget_state(st.session_state, NAVIGATION_PAGES)
+
+        selected_page = st.radio(
+            "Go to:",
+            options=NAVIGATION_PAGES,
+            key="nav_radio",
+            on_change=sync_sidebar_navigation,
         )
+
+        st.divider()
+
+        # Milestone 7.3: Active Dataset Selector
+        st.header("Active Dataset")
+        ds_options = [d.dataset_id for d in registered_datasets]
+        ds_index = ds_options.index(resolved_active_id) if resolved_active_id in ds_options else 0
+
+        st.selectbox(
+            "Select Active Dataset:",
+            options=ds_options,
+            index=ds_index,
+            format_func=lambda did: f"{next((d.name for d in registered_datasets if d.dataset_id == did), did)} ({did})",
+            key="active_dataset_selector_widget",
+            help="Select the active dataset workspace.",
+            on_change=select_active_dataset,
+            args=("active_dataset_selector_widget", ds_options),
+        )
+
+        # Prominent display of current active workspace
+        with st.container(border=True):
+            st.caption("Active Workspace:")
+            st.markdown(f"**{active_dataset.name}**")
+            st.caption(f"`{active_dataset.dataset_id}`")
+            if selected_page != NAV_WORKSPACE:
+                st.button(
+                    "📁 Go to Workspace",
+                    key="sidebar_btn_go_ws",
+                    use_container_width=True,
+                    on_click=navigate_to,
+                    args=(NAV_WORKSPACE,),
+                )
+
+        st.divider()
+
+        # Dataset scoping: incidents scoped to active workspace
+        if "dataset_id" in raw_df.columns:
+            active_incidents_df = raw_df[raw_df["dataset_id"] == active_dataset.dataset_id].copy()
+        else:
+            if active_dataset.dataset_id == DEFAULT_DATASET_ID:
+                active_incidents_df = raw_df.copy()
+            else:
+                active_incidents_df = raw_df.iloc[0:0].copy()
+
+        # Machine filter (shown for pages that use incident data)
+        pages_with_machine_filter = {NAV_INCIDENTS, NAV_FAULT_ANALYSIS, NAV_CROSS_INCIDENT}
+        if selected_page in pages_with_machine_filter:
+            st.header("Controls & Filters")
+            avail_machines = sorted([str(m) for m in active_incidents_df["machine_id"].dropna().unique().tolist()]) if not active_incidents_df.empty else []
+            machine_options = ["All Machines"] + avail_machines
+            selected_machine = st.selectbox(
+                "Select Machine ID",
+                options=machine_options,
+                index=0,
+                help="Filter maintenance incidents by specific machine unit.",
+            )
+        else:
+            selected_machine = "All Machines"
 
         st.divider()
         st.markdown(
@@ -963,98 +2008,160 @@ def main() -> None:
             """
         )
 
-    filtered_df = filter_by_machine(raw_df, selected_machine)
+    filtered_df = filter_by_machine(active_incidents_df, selected_machine)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(label="Total Incidents", value=len(filtered_df))
-    with col2:
-        distinct_machines = filtered_df["machine_id"].nunique()
-        st.metric(label="Distinct Machines", value=distinct_machines)
-    with col3:
-        distinct_symptoms = filtered_df["symptom"].nunique()
-        st.metric(label="Distinct Symptoms", value=distinct_symptoms)
-    with col4:
-        active_filter_label = "All Units" if selected_machine == "All Machines" else selected_machine
-        st.metric(label="Filter Applied", value=active_filter_label)
+    # --- Page Routing ---
+    if selected_page == NAV_HUB:
+        render_central_hub(ingestion_service.store, raw_df, active_dataset=active_dataset)
 
-    st.markdown("---")
+    elif selected_page == NAV_WORKSPACE:
+        render_dataset_workspace(
+            ingestion_service.store,
+            raw_df,
+            active_dataset=active_dataset,
+            active_warning=active_warning,
+        )
 
-    st.subheader("Maintenance Incidents Table")
-    if filtered_df.empty:
-        st.info("No records match the current filter selection.")
-    else:
-        st.dataframe(
+    elif selected_page == NAV_INCIDENTS:
+        # Existing M1 incident management (metrics, table, detail inspector, timeline)
+        st.caption(
+            f"ℹ️ Scope: Active Dataset — **{active_dataset.name}** (`{active_dataset.dataset_id}`). "
+            f"Showing {len(filtered_df)} incident(s)."
+        )
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(label="Total Incidents", value=len(filtered_df))
+        with col2:
+            distinct_machines = filtered_df["machine_id"].nunique()
+            st.metric(label="Distinct Machines", value=distinct_machines)
+        with col3:
+            distinct_symptoms = filtered_df["symptom"].nunique()
+            st.metric(label="Distinct Symptoms", value=distinct_symptoms)
+        with col4:
+            active_filter_label = "All Units" if selected_machine == "All Machines" else selected_machine
+            st.metric(label="Filter Applied", value=active_filter_label)
+
+        st.markdown("---")
+
+        st.subheader("Maintenance Incidents Table")
+        if filtered_df.empty:
+            st.info("No records match the current filter selection.")
+        else:
+            st.dataframe(
+                filtered_df,
+                use_container_width=True,
+                column_config={
+                    "incident_id": st.column_config.TextColumn("Incident ID", width="small"),
+                    "machine_id": st.column_config.TextColumn("Machine ID", width="small"),
+                    "date": st.column_config.DateColumn("Date", width="small"),
+                    "symptom": st.column_config.TextColumn("Reported Symptom", width="large"),
+                    "maintenance_action": st.column_config.TextColumn("Maintenance Action Taken", width="large"),
+                    "outcome": st.column_config.TextColumn("Outcome / Verification", width="large"),
+                },
+                hide_index=True,
+            )
+
+        st.subheader("Incident Detail Inspector")
+        if not filtered_df.empty:
+            available_ids = filtered_df["incident_id"].tolist()
+            selected_id = st.selectbox(
+                "Select an incident to inspect details:",
+                options=available_ids,
+                index=0,
+                key=f"inspector_select_{selected_machine}",
+            )
+
+            selected_record = get_incident_by_id(filtered_df, selected_id)
+            if selected_record is not None:
+                with st.container(border=True):
+                    sub_col1, sub_col2, sub_col3 = st.columns(3)
+                    with sub_col1:
+                        st.caption("Incident ID")
+                        st.markdown(f"**`{selected_record['incident_id']}`**")
+                    with sub_col2:
+                        st.caption("Machine ID")
+                        st.markdown(f"**`{selected_record['machine_id']}`**")
+                    with sub_col3:
+                        st.caption("Incident Date")
+                        st.markdown(f"**{selected_record['date']}**")
+
+                    st.markdown("---")
+                    st.markdown(f"**Reported Symptom:**\n\n{selected_record['symptom']}")
+                    st.markdown(f"**Maintenance Action Taken:**\n\n{selected_record['maintenance_action']}")
+                    st.markdown(f"**Outcome & Verification:**\n\n{selected_record['outcome']}")
+        else:
+            st.info("No incident available for the selected filter.")
+
+        st.markdown("---")
+
+        # Milestone 5.2: Incident Timeline
+        render_incident_timeline(
             filtered_df,
-            use_container_width=True,
-            column_config={
-                "incident_id": st.column_config.TextColumn("Incident ID", width="small"),
-                "machine_id": st.column_config.TextColumn("Machine ID", width="small"),
-                "date": st.column_config.DateColumn("Date", width="small"),
-                "symptom": st.column_config.TextColumn("Reported Symptom", width="large"),
-                "maintenance_action": st.column_config.TextColumn("Maintenance Action Taken", width="large"),
-                "outcome": st.column_config.TextColumn("Outcome / Verification", width="large"),
-            },
-            hide_index=True,
+            dataset_id=active_dataset.dataset_id,
+            store=ingestion_service.store,
         )
 
-    st.subheader("Incident Detail Inspector")
-    selected_record: Optional[pd.Series] = None
-    if not filtered_df.empty:
-        available_ids = filtered_df["incident_id"].tolist()
-        selected_id = st.selectbox(
-            "Select an incident to inspect details:",
-            options=available_ids,
-            index=0,
-            key=f"inspector_select_{selected_machine}",
+    elif selected_page == NAV_EVIDENCE_INGESTION:
+        render_evidence_ingestion(
+            ingestion_service,
+            search_index,
+            active_dataset=active_dataset,
         )
 
-        selected_record = get_incident_by_id(filtered_df, selected_id)
-        if selected_record is not None:
-            with st.container(border=True):
-                sub_col1, sub_col2, sub_col3 = st.columns(3)
-                with sub_col1:
-                    st.caption("Incident ID")
-                    st.markdown(f"**`{selected_record['incident_id']}`**")
-                with sub_col2:
-                    st.caption("Machine ID")
-                    st.markdown(f"**`{selected_record['machine_id']}`**")
-                with sub_col3:
-                    st.caption("Incident Date")
-                    st.markdown(f"**{selected_record['date']}**")
+    elif selected_page == NAV_EVIDENCE_SEARCH:
+        render_evidence_search(
+            retriever,
+            search_index,
+            ingestion_service.store,
+            active_dataset=active_dataset,
+        )
 
-                st.markdown("---")
-                st.markdown(f"**Reported Symptom:**\n\n{selected_record['symptom']}")
-                st.markdown(f"**Maintenance Action Taken:**\n\n{selected_record['maintenance_action']}")
-                st.markdown(f"**Outcome & Verification:**\n\n{selected_record['outcome']}")
-    else:
-        st.info("No incident available for the selected filter.")
+    elif selected_page == NAV_FAULT_ANALYSIS:
+        # Need incident selection for fault analysis
+        selected_record: Optional[pd.Series] = None
+        if active_incidents_df.empty:
+            st.subheader("🧠 Evidence-Grounded Fault Analysis")
+            ds_name = active_dataset.name if active_dataset else "Selected Dataset"
+            ds_id = active_dataset.dataset_id if active_dataset else DEFAULT_DATASET_ID
+            st.info(
+                f"ℹ️ **No Incidents in Active Dataset:** The active workspace **{ds_name}** (`{ds_id}`) "
+                f"contains 0 maintenance incidents. To analyze faults, either switch to a dataset with registered incidents "
+                f"(such as **Default Dataset**) or register incidents in this dataset. Cross-dataset incident borrowing is strictly disabled to preserve isolation."
+            )
+            render_fault_analysis(analyzer, None, active_dataset=active_dataset)
+        else:
+            if not filtered_df.empty:
+                available_ids = filtered_df["incident_id"].tolist()
+                selected_id = st.selectbox(
+                    "Select an incident for fault analysis:",
+                    options=available_ids,
+                    index=0,
+                    key=f"analysis_incident_select_{selected_machine}",
+                )
+                selected_record = get_incident_by_id(filtered_df, selected_id)
 
-    ingestion_service = get_ingestion_service()
-    search_index, retriever, analyzer, comparison_engine, evidence_linker = get_search_components()
+                if selected_record is not None:
+                    with st.container(border=True):
+                        sel_c1, sel_c2, sel_c3 = st.columns(3)
+                        with sel_c1:
+                            st.caption("Selected Incident")
+                            st.markdown(f"**`{selected_record['incident_id']}`**")
+                        with sel_c2:
+                            st.caption("Machine")
+                            st.markdown(f"**`{selected_record['machine_id']}`**")
+                        with sel_c3:
+                            st.caption("Symptom")
+                            st.markdown(f"*{selected_record['symptom']}*")
 
-    # Milestone 5.2: Incident Timeline
-    render_incident_timeline(filtered_df)
+            render_fault_analysis(analyzer, selected_record, active_dataset=active_dataset)
 
-    st.markdown("---")
-
-    # Milestone 5.4: Cross-Incident Comparison & Evidence Linking
-    render_cross_incident_analysis(filtered_df, comparison_engine, evidence_linker)
-
-    st.markdown("---")
-
-    # Milestone 4.1.2: Evidence-Grounded Fault Analysis
-    render_fault_analysis(analyzer, selected_record)
-
-    st.markdown("---")
-
-    # Milestone 3: Evidence Search & Passage Retrieval
-    render_evidence_search(retriever, search_index, ingestion_service.store)
-
-    st.markdown("---")
-
-    # Milestone 2: Evidence Ingestion & Document Management
-    render_evidence_ingestion(ingestion_service, search_index)
+    elif selected_page == NAV_CROSS_INCIDENT:
+        render_cross_incident_analysis(
+            filtered_df,
+            comparison_engine,
+            evidence_linker,
+            active_dataset=active_dataset,
+        )
 
 
 if __name__ == "__main__":

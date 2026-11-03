@@ -21,12 +21,14 @@ Ghostvault/
 │       ├── originals/       # Safe storage of raw uploaded files (<doc_id>_<safe_name>)
 │       ├── extracted/       # Extracted plain text UTF-8 files (<doc_id>.txt)
 │       ├── metadata/
-│       │   └── catalog.json # Structured document catalog and ingestion metadata
+│       │   ├── catalog.json # Document catalog and dataset associations
+│       │   └── datasets.json # Persistent dataset registry
 │       └── index/
 │           └── evidence_index.db # SQLite FTS5 persistent full-text search index
 ├── src/
 │   ├── __init__.py
 │   ├── data_loader.py       # Incident dataset validation, relative loading, and filtering
+│   ├── hub.py               # Project summaries, dataset state, integrity, and navigation
 │   ├── models.py            # Typed domain models (Incidents, Chunks, SearchResults, Hypotheses, Scopes)
 │   ├── extractor.py         # Isolated text extraction for TXT and PDF (pypdf)
 │   ├── storage.py           # Atomic writes, path traversal sanitization, and catalog management
@@ -43,7 +45,13 @@ Ghostvault/
     ├── test_retrieval.py    # Unit tests for chunking, FTS5 indexing, and BM25 retrieval
     ├── test_analysis.py     # Unit tests for fault analysis, deduplication, and quality hardening
     ├── test_cross_incident.py # Unit tests for cross-incident recurrence and comparison
-    └── test_evidence_linker.py # Unit tests for cross-incident evidence linking
+    ├── test_evidence_linker.py # Unit tests for cross-incident evidence linking
+    ├── test_workspace.py    # Dataset workspace, active state, and association tests
+    ├── test_dataset_storage.py # Dataset persistence and legacy migration tests
+    ├── test_dataset_isolation.py # Dataset-scoping regression tests
+    ├── test_dataset_ownership.py # Ownership validation across registry, catalog, and index
+    ├── test_dataset_retrieval.py # Strict dataset-scoped evidence retrieval
+    └── test_m7_3_stabilization.py # Navigation, UI state, and integrity regressions
 ```
 
 ---
@@ -138,6 +146,30 @@ Ghostvault/
 - **Guidance vs Equipment Context:** Distinguishes machine-specific inspection records (`EXACT_MACHINE`) from general maintenance guides (`GENERAL_REFERENCE`) and flags illustrative test readings with caution notices.
 - **Causal Safety Boundary:** Explicitly establishes that evidence links provide technical context and mechanism explanations, but do not prove that recurring symptoms across different machines share an identical root cause.
 
+### Dataset Workspaces & Scope
+- The Central Intelligence Hub is project-wide; the Dataset Workspace, incident management, evidence retrieval, fault analysis (including evidence verification), and cross-incident analysis use the selected dataset.
+- Evidence Search results are dataset-scoped. Index statistics, index synchronization/rebuild actions, and the separately labeled project-wide document catalog cover the full local project.
+- Legacy incident CSVs without a `dataset_id` are treated as belonging to `DATASET-DEFAULT` in memory. Loading them does not rewrite the CSV.
+- Documents with no dataset ID remain unassigned and are not counted in any workspace. The Hub distinguishes these from documents referencing an unregistered dataset ID.
+- Associating unassigned legacy documents with `DATASET-DEFAULT` requires an explicit confirmation and action in the Hub. This migration is idempotent and does not change documents with existing dataset IDs or assign records to a newly created dataset.
+- Sidebar navigation is authoritative in session state; page shortcuts update that state through callbacks, and the sidebar radio is synchronized before its widget is created.
+
+### M7.4.1 Dataset Ownership & Integrity
+- `datasets.json` is the authoritative registry of valid dataset IDs. Dataset IDs are immutable after creation; dataset deletion is not supported.
+- The incident CSV owns incident `dataset_id` values. A legacy CSV with no dataset column receives `DATASET-DEFAULT` in memory; optional registry validation rejects explicit missing or unregistered references without rewriting the file.
+- `catalog.json` owns document dataset IDs. Missing IDs and non-empty unregistered IDs are reported separately and remain unchanged unless the existing explicit legacy migration is used for missing IDs.
+- `indexed_documents.dataset_id` and `evidence_chunks.dataset_id` are synchronized ownership snapshots, not independent sources of ownership. Indexing requires an `EvidenceStore` and validates the canonical catalog owner; metadata-only indexing is rejected. `SearchIndex.validate_integrity()` reports missing documents, dangling IDs, owner mismatches, and chunk/FTS reference inconsistencies.
+- Index rebuild refuses to clear an index while ownership or index-integrity issues remain. Index synchronization reports ownership errors and does not assign missing document owners.
+- The confirmed ownership repair is limited to the six approved processed document IDs and `DATASET-DEFAULT`. Preview inspects catalog, index-document, relational-chunk, registry, and FTS state; apply requires a fresh ready preview and does not modify evidence files or FTS content.
+- Catalog JSON and SQLite cannot share a single atomic transaction. Repair therefore writes a durable journal at `metadata/ownership-repair/<repair-id>.json` before changing either store, then applies catalog and SQLite changes in separate recoverable stages and verifies all affected layers before marking the journal `verified`. If interrupted, call `EvidenceStore.recover_document_ownership_repair(repair_id, index, action="resume")` to safely complete it or `action="rollback"` to restore the recorded ownership values. Recovery only accepts the six approved IDs and refuses unexpected intervening changes. Keep the journal until the operation has been reviewed.
+- SQLite schema versions are recorded in both `PRAGMA user_version` and `schema_migrations`: v1 is the base index, v2 adds nullable ownership columns, and v3 removes SQL-level ownership defaults without assigning or changing any values. Existing databases are backed up before migration.
+
+### M7.4.2 Dataset-Scoped Evidence Retrieval
+- Evidence retrieval requires an explicitly supplied dataset ID registered in `datasets.json`; missing, blank, and unregistered IDs fail closed.
+- FTS5 search is constrained by both the indexed-document and evidence-chunk dataset snapshots, then checked against the catalog's authoritative document owner and provenance.
+- Dataset-scoped integrity validation blocks retrieval when relevant catalog, index, chunk, or FTS records disagree. It reports diagnostics without migrating, repairing, or rebuilding data.
+- Evidence Search displays the active dataset and its integrity status. Index statistics and maintenance actions remain explicitly project-wide.
+
 ---
 
 ## Local Setup & Launch Instructions (Windows PowerShell)
@@ -191,8 +223,6 @@ Open `http://localhost:8501` in your browser.
 - [x] Incident Timeline with chronological ordering, missing-date segregation, and temporal metrics
 - [x] Cross-incident evidence linking with substantive passage validation and causal safety boundaries
 - [x] Integrated cross-incident dashboard with symptom grouping, evidence links, and safety disclaimers
-- [x] 89 automated tests across incidents, ingestion, retrieval, analysis, comparison, timelines, and evidence linking
-
-
-
-
+- [x] Persistent dataset registry, active-dataset selection, project hub, and isolated workspace summaries
+- [x] Callback-safe navigation and explicit, idempotent legacy evidence-association migration
+- [x] 224 automated tests across incidents, ingestion, retrieval, analysis, dataset ownership, comparison, timelines, and evidence linking

@@ -4,7 +4,13 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 import hashlib
 
-from src.models import DocumentMetadata, DocumentStatus, ErrorCode, current_iso_timestamp
+from src.models import (
+    DocumentMetadata,
+    DocumentStatus,
+    ErrorCode,
+    DatasetOwnershipError,
+    current_iso_timestamp,
+)
 from src.extractor import TextExtractor, ExtractionResult
 from src.storage import EvidenceStore
 
@@ -51,6 +57,7 @@ class IngestionService:
         filename: str,
         content: bytes,
         source_type: str = "manual_upload",
+        dataset_id: Optional[str] = None,
     ) -> DocumentMetadata:
         """
         Execute full ingestion pipeline for an uploaded file:
@@ -59,12 +66,20 @@ class IngestionService:
         3. Save original document safely.
         4. Extract text.
         5. Save extracted text.
-        6. Persist metadata catalog.
+        6. Persist metadata catalog with associated dataset_id.
         """
         doc_id = self.store.generate_document_id()
         timestamp = current_iso_timestamp()
         suffix = Path(filename).suffix.lower().lstrip(".")
         file_type = suffix if suffix else "unknown"
+        if not isinstance(dataset_id, str) or not dataset_id.strip():
+            raise DatasetOwnershipError("New document dataset ID cannot be blank.")
+        target_dataset_id = dataset_id
+        self.store.require_dataset_id(
+            target_dataset_id,
+            "New document",
+            filename or "<unnamed>",
+        )
 
         # Step 1: Pre-validation
         is_valid, err_code, err_msg = self.validate_upload(filename, content)
@@ -82,6 +97,7 @@ class IngestionService:
                 extracted_character_count=0,
                 error_code=err_code.value if err_code else None,
                 error_message=err_msg,
+                dataset_id=target_dataset_id,
             )
             self.store.add_or_update_metadata(metadata)
             return metadata
@@ -103,6 +119,7 @@ class IngestionService:
                 extracted_character_count=0,
                 error_code=ErrorCode.STORAGE_ERROR.value,
                 error_message=f"Failed to write original document to storage: {exc}",
+                dataset_id=target_dataset_id,
             )
             self.store.add_or_update_metadata(metadata)
             return metadata
@@ -135,6 +152,7 @@ class IngestionService:
                 extracted_character_count=0,
                 error_code=extraction_result.error_code.value if extraction_result.error_code else None,
                 error_message=extraction_result.error_message,
+                dataset_id=target_dataset_id,
             )
             self.store.add_or_update_metadata(metadata)
             return metadata
@@ -157,6 +175,7 @@ class IngestionService:
                 extracted_character_count=0,
                 error_code=ErrorCode.STORAGE_ERROR.value,
                 error_message=f"Failed to write extracted text file: {exc}",
+                dataset_id=target_dataset_id,
             )
             self.store.add_or_update_metadata(metadata)
             return metadata
@@ -176,6 +195,7 @@ class IngestionService:
             extracted_character_count=extraction_result.char_count,
             error_code=None,
             error_message=None,
+            dataset_id=target_dataset_id,
         )
         self.store.add_or_update_metadata(metadata)
         return metadata

@@ -17,8 +17,11 @@ from src.models import (
     IncidentTimelineEntry,
     ComparisonLimitation,
     RecurrenceScope,
+    DEFAULT_DATASET_ID,
+    DatasetOwnershipError,
     current_iso_timestamp,
 )
+from src.storage import EvidenceStore
 
 
 def normalize_symptom_text(text: Optional[str]) -> Tuple[str, List[str]]:
@@ -140,21 +143,29 @@ def compute_recurrence_scope(machine_ids: List[Optional[str]]) -> RecurrenceScop
     return RecurrenceScope.CROSS_MACHINE
 
 
+def _incident_dataset_id(record: Dict[str, Any]) -> str:
+    value = record.get("dataset_id")
+    if value is None or pd.isna(value) or not str(value).strip():
+        return DEFAULT_DATASET_ID
+    return str(value)
+
+
 class CrossIncidentComparisonEngine:
     """
     Deterministic comparison engine for cross-incident analysis.
     Identifies recurring symptoms, evaluates timeline-readiness, and reports data limitations.
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, store: Optional[EvidenceStore] = None):
+        self.store = store
 
     def compare_incidents(
         self,
         incidents: Union[List[Dict[str, Any]], pd.DataFrame],
+        dataset_id: Optional[str] = None,
     ) -> CrossIncidentComparisonResult:
         """
-        Compare a list or DataFrame of incident records deterministically.
+        Compare a list or DataFrame of incident records deterministically, scoped to a dataset.
         """
         if isinstance(incidents, pd.DataFrame):
             records = incidents.to_dict(orient="records")
@@ -162,6 +173,33 @@ class CrossIncidentComparisonEngine:
             records = incidents
         else:
             records = []
+
+        target_ds = dataset_id
+        if target_ds is not None:
+            if self.store is None:
+                raise DatasetOwnershipError(
+                    "Dataset-scoped incident comparison requires an EvidenceStore registry."
+                )
+            self.store.require_dataset_id(target_ds, "Incident comparison", "active dataset")
+        else:
+            owners = {
+                _incident_dataset_id(rec)
+                for rec in records
+            }
+            if len(owners) > 1:
+                raise DatasetOwnershipError(
+                    "Incident comparison cannot mix records from different datasets; "
+                    "select one registered dataset."
+                )
+            target_ds = next(iter(owners), None)
+
+        for rec in records:
+            record_dataset_id = _incident_dataset_id(rec)
+            if record_dataset_id != target_ds:
+                raise DatasetOwnershipError(
+                    f"Incident '{rec.get('incident_id', 'UNKNOWN_INCIDENT')}' belongs to "
+                    f"dataset '{record_dataset_id}', not comparison dataset '{target_ds}'."
+                )
 
         comparison_id = f"CMP-{hashlib.sha256(str(current_iso_timestamp()).encode('utf-8')).hexdigest()[:12].upper()}"
 
@@ -304,6 +342,7 @@ class CrossIncidentComparisonEngine:
                 grouping_basis=basis,
                 original_symptoms=orig_symptoms,
                 maintenance_actions=maint_actions,
+                dataset_id=target_ds,
             )
             symptom_groups.append(group)
 
@@ -369,11 +408,14 @@ class CrossIncidentComparisonEngine:
             missing_fields_summary=missing_counts,
             limitations=limitations,
             compared_at=current_iso_timestamp(),
+            dataset_id=target_ds,
         )
 
 
 def generate_incident_timeline(
-    incidents: Union[List[Dict[str, Any]], pd.DataFrame]
+    incidents: Union[List[Dict[str, Any]], pd.DataFrame],
+    dataset_id: Optional[str] = None,
+    store: Optional[EvidenceStore] = None,
 ) -> Tuple[List[IncidentTimelineEntry], List[IncidentTimelineEntry], Dict[str, int]]:
     """
     Deterministically generate chronological timeline entries from incident records.
@@ -382,8 +424,8 @@ def generate_incident_timeline(
     Returns:
         (dated_entries, undated_entries, missing_counts_summary)
     """
-    engine = CrossIncidentComparisonEngine()
-    result = engine.compare_incidents(incidents)
+    engine = CrossIncidentComparisonEngine(store=store)
+    result = engine.compare_incidents(incidents, dataset_id=dataset_id)
 
     dated = [entry for entry in result.timeline_entries if entry.is_date_valid]
     undated = [entry for entry in result.timeline_entries if not entry.is_date_valid]
@@ -395,4 +437,3 @@ def generate_incident_timeline(
     undated.sort(key=lambda x: (x.raw_date or "", x.incident_id))
 
     return (dated, undated, result.missing_fields_summary)
-

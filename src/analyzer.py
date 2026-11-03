@@ -5,7 +5,7 @@ deterministic support-reason generation, and accurate pipeline count derivation.
 """
 
 import re
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple, Iterable
 import pandas as pd
 
 from src.models import (
@@ -20,6 +20,7 @@ from src.models import (
     VerificationStatus,
     EvidenceStrength,
     EvidenceCounts,
+    DatasetOwnershipError,
     current_iso_timestamp,
 )
 from src.retriever import EvidenceRetriever
@@ -283,10 +284,32 @@ def generate_support_reason(
     return f"{prefix} {rel}{suffix}"
 
 
+def _validate_scoped_references(
+    references: List[EvidenceReference],
+    dataset_id: Optional[str],
+    evidence_retriever: Optional[EvidenceRetriever],
+    operation: str,
+) -> None:
+    if not dataset_id or not references:
+        return
+    if any(not ref.dataset_id or ref.dataset_id != dataset_id for ref in references):
+        raise DatasetOwnershipError(
+            f"{operation} rejected untagged or foreign evidence for active dataset "
+            f"'{dataset_id}'."
+        )
+    if evidence_retriever is None:
+        raise DatasetOwnershipError(
+            f"{operation} cannot trust scoped evidence without canonical catalog validation."
+        )
+    evidence_retriever.validate_evidence_references(references, dataset_id)
+
+
 def verify_hypothesis_evidence(
     hypothesis: InvestigativeHypothesis,
     incident_machine_id: Optional[str] = None,
     pattern: Optional[Dict[str, Any]] = None,
+    dataset_id: Optional[str] = None,
+    evidence_retriever: Optional[EvidenceRetriever] = None,
 ) -> Tuple[VerificationStatus, str]:
     """
     Deterministic evidence verification for a diagnostic hypothesis (Milestone 6.1).
@@ -295,8 +318,17 @@ def verify_hypothesis_evidence(
     - SUPPORTED: Relevant evidence provides a clear, traceable reason to consider the hypothesis plausible.
     - INCONCLUSIVE: Evidence is missing, unrelated, ambiguous, or insufficient.
     """
-    supporting = hypothesis.supporting_evidence or []
-    contradictory = hypothesis.contradictory_evidence or []
+    raw_supporting = hypothesis.supporting_evidence or []
+    raw_contradictory = hypothesis.contradictory_evidence or []
+
+    _validate_scoped_references(
+        raw_supporting + raw_contradictory,
+        dataset_id,
+        evidence_retriever,
+        "Verification",
+    )
+    supporting = raw_supporting
+    contradictory = raw_contradictory
 
     # Rule 1: No retrieved evidence at all
     if not supporting and not contradictory:
@@ -419,6 +451,8 @@ def evaluate_evidence_strength(
     hypothesis: InvestigativeHypothesis,
     verification_status: VerificationStatus,
     incident_machine_id: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    evidence_retriever: Optional[EvidenceRetriever] = None,
 ) -> Tuple[EvidenceStrength, str]:
     """
     Qualitative evidence strength assessment for a diagnostic hypothesis (Milestone 6.2).
@@ -435,6 +469,12 @@ def evaluate_evidence_strength(
     """
     supporting = hypothesis.supporting_evidence or []
     contradictory = hypothesis.contradictory_evidence or []
+    _validate_scoped_references(
+        supporting + contradictory,
+        dataset_id,
+        evidence_retriever,
+        "Evidence strength",
+    )
 
     # Case 1: Inadequate provenance or contradictory evidence limitations
     if verification_status == VerificationStatus.CONTRADICTED:
@@ -500,6 +540,8 @@ def derive_missing_evidence_guidance(
     hypothesis: InvestigativeHypothesis,
     incident_record: Dict[str, Any],
     pattern: Optional[Dict[str, Any]] = None,
+    dataset_id: Optional[str] = None,
+    evidence_retriever: Optional[EvidenceRetriever] = None,
 ) -> str:
     """
     Derives cautious, grounded missing-evidence guidance for a hypothesis (Milestone 6.2).
@@ -511,6 +553,14 @@ def derive_missing_evidence_guidance(
     2. Only suggests gaps justified by the actual hypothesis and incident facts.
     3. If no reliable suggestion can be derived, returns 'No specific evidence gap identified.'
     """
+    supporting = hypothesis.supporting_evidence or []
+    _validate_scoped_references(
+        supporting,
+        dataset_id,
+        evidence_retriever,
+        "Missing-evidence guidance",
+    )
+
     symptom = incident_record.get("symptom", "").lower()
     maintenance = incident_record.get("maintenance_action", "").lower()
     combined = f"{symptom} {maintenance}"
@@ -519,7 +569,7 @@ def derive_missing_evidence_guidance(
     title = hypothesis.title.lower()
 
     # Look at existing supporting snippets to see what is already documented
-    existing_snippets = " ".join([s.snippet.lower() for s in hypothesis.supporting_evidence or []])
+    existing_snippets = " ".join([s.snippet.lower() for s in supporting])
 
     # 1. Bearing Degradation
     if "bearing" in title:
@@ -606,23 +656,42 @@ class FaultAnalysisEngine:
         self,
         incident_record: Dict[str, Any],
         max_results: int = 10,
+        dataset_id: Optional[str] = None,
+        valid_dataset_ids: Optional[Iterable[str]] = None,
     ) -> List[SearchResult]:
-        """Build bounded queries and retrieve matching passages, preserving raw query results."""
+        """Build bounded queries and retrieve matching passages scoped to dataset, preserving raw query results."""
+        target_ds_id = self.retriever.require_dataset_scope(dataset_id, valid_dataset_ids)
+        incident_ds_id = incident_record.get("dataset_id")
+        if incident_ds_id is None and target_ds_id == "DATASET-DEFAULT":
+            incident_ds_id = target_ds_id
+        if incident_ds_id != target_ds_id:
+            raise DatasetOwnershipError(
+                f"Incident '{incident_record.get('incident_id', 'UNKNOWN_INCIDENT')}' does not "
+                f"belong to active dataset '{target_ds_id}'."
+            )
+
         search_terms = self.extract_search_terms(incident_record)
         if not search_terms:
             return []
 
         query_str = " ".join(search_terms[:5])
-        try:
-            results = self.retriever.search(query=query_str, limit=max_results)
-        except Exception:
-            return []
+        results = self.retriever.search(
+            query=query_str,
+            limit=max_results,
+            dataset_id=target_ds_id,
+            valid_dataset_ids=valid_dataset_ids,
+        )
 
         if not results and len(search_terms) > 0:
             seen_chunk_ids: Set[str] = set()
             fallback_results: List[SearchResult] = []
             for term in search_terms[:4]:
-                sub_results = self.retriever.search(query=term, limit=3)
+                sub_results = self.retriever.search(
+                    query=term,
+                    limit=3,
+                    dataset_id=target_ds_id,
+                    valid_dataset_ids=valid_dataset_ids,
+                )
                 for res in sub_results:
                     if res.chunk.chunk_id not in seen_chunk_ids:
                         seen_chunk_ids.add(res.chunk.chunk_id)
@@ -705,14 +774,17 @@ class FaultAnalysisEngine:
         self,
         incident_record: Dict[str, Any],
         evidence_results: Optional[List[SearchResult]] = None,
+        dataset_id: Optional[str] = None,
+        valid_dataset_ids: Optional[Iterable[str]] = None,
     ) -> FaultAnalysisResult:
         """
-        Perform evidence-grounded fault analysis with substantive relevance validation.
+        Perform evidence-grounded fault analysis with substantive relevance validation and dataset isolation.
         """
         incident_id = incident_record.get("incident_id", "UNKNOWN_INCIDENT")
         machine_id = incident_record.get("machine_id", "UNKNOWN_MACHINE")
         symptom = incident_record.get("symptom", "")
         maintenance_action = incident_record.get("maintenance_action", "")
+        target_ds_id = dataset_id if dataset_id is not None else incident_record.get("dataset_id")
 
         timestamp = current_iso_timestamp()
 
@@ -731,10 +803,27 @@ class FaultAnalysisEngine:
                 error_message="Incident record is missing required symptom or machine_id.",
             )
 
+        target_ds_id = self.retriever.require_dataset_scope(target_ds_id, valid_dataset_ids)
+        incident_ds_id = incident_record.get("dataset_id")
+        if incident_ds_id is None and target_ds_id == "DATASET-DEFAULT":
+            incident_ds_id = target_ds_id
+        if incident_ds_id != target_ds_id:
+            raise DatasetOwnershipError(
+                f"Incident '{incident_id}' belongs to dataset '{incident_ds_id}', not active "
+                f"dataset '{target_ds_id}'."
+            )
+
         if evidence_results is None:
-            raw_evidence = self.retrieve_incident_evidence(incident_record)
+            raw_evidence = self.retrieve_incident_evidence(
+                incident_record,
+                dataset_id=target_ds_id,
+                valid_dataset_ids=valid_dataset_ids,
+            )
         else:
-            raw_evidence = evidence_results
+            raw_evidence = self.retriever.validate_evidence_results(
+                evidence_results,
+                target_ds_id,
+            )
 
         raw_count = len(raw_evidence)
 
@@ -795,6 +884,7 @@ class FaultAnalysisEngine:
                         referenced_machine_id=conflicting_machine,
                         is_excerpt=is_excerpt,
                         exclusion_reason=exc_reason,
+                        dataset_id=r.chunk.dataset_id,
                     )
                 )
 
@@ -844,6 +934,7 @@ class FaultAnalysisEngine:
                                 quality=PassageQuality.SUBSTANTIVE_TECHNICAL,
                                 referenced_machine_id=conflicting_machine,
                                 is_excerpt=is_excerpt,
+                                dataset_id=chunk.dataset_id,
                             )
                         )
                     else:
@@ -861,6 +952,7 @@ class FaultAnalysisEngine:
                                 quality=PassageQuality.SUBSTANTIVE_TECHNICAL,
                                 referenced_machine_id=machine_id if scope == MachineScope.EXACT_MACHINE else None,
                                 is_excerpt=is_excerpt,
+                                dataset_id=chunk.dataset_id,
                             )
                         )
 
@@ -896,6 +988,8 @@ class FaultAnalysisEngine:
                     hyp,
                     incident_machine_id=machine_id,
                     pattern=pattern,
+                    dataset_id=target_ds_id,
+                    evidence_retriever=self.retriever,
                 )
                 hyp.verification_status = status
                 hyp.verification_explanation = explanation
@@ -904,6 +998,8 @@ class FaultAnalysisEngine:
                     hyp,
                     verification_status=status,
                     incident_machine_id=machine_id,
+                    dataset_id=target_ds_id,
+                    evidence_retriever=self.retriever,
                 )
                 hyp.evidence_strength = strength
                 hyp.evidence_strength_explanation = strength_explanation
@@ -912,6 +1008,8 @@ class FaultAnalysisEngine:
                     hyp,
                     incident_record=incident_record,
                     pattern=pattern,
+                    dataset_id=target_ds_id,
+                    evidence_retriever=self.retriever,
                 )
                 hyp.missing_evidence_guidance = gap_guidance
 

@@ -8,7 +8,7 @@ from direct incident evidence, and excludes low-value passages without inferring
 
 import re
 import hashlib
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple, Iterable
 
 from src.models import (
     SymptomGroup,
@@ -20,6 +20,7 @@ from src.models import (
     PassageQuality,
     EvidenceContextType,
     MachineScope,
+    DatasetOwnershipError,
     ComparisonLimitation,
     SearchResult,
     current_iso_timestamp,
@@ -201,12 +202,29 @@ class CrossIncidentEvidenceLinker:
         self,
         group: SymptomGroup,
         max_results: int = 8,
+        dataset_id: Optional[str] = None,
+        valid_dataset_ids: Optional[Iterable[str]] = None,
     ) -> GroupEvidenceLinkResult:
         """
-        Link an individual SymptomGroup to substantive evidence passages.
+        Link an individual SymptomGroup to substantive evidence passages within dataset scope.
         Filters out search-term metadata, extracts readable sentence-bounded snippets,
         and records provenance limitations.
         """
+        target_dataset_id = self.retriever.require_dataset_scope(
+            dataset_id,
+            valid_dataset_ids,
+        )
+        group_dataset_id = group.dataset_id
+        if group_dataset_id is None and target_dataset_id == "DATASET-DEFAULT":
+            group_dataset_id = target_dataset_id
+        if group_dataset_id != target_dataset_id:
+            raise DatasetOwnershipError(
+                f"Symptom group '{group.group_id}' is untagged or belongs to dataset "
+                f"'{group_dataset_id}', not active dataset '{target_dataset_id}'."
+            )
+        if not group.incident_ids and group.occurrences_count:
+            raise DatasetOwnershipError("Symptom group has no incident provenance.")
+
         query_terms = self.extract_group_query_terms(group)
         group_limitations: List[str] = [
             "Evidence links indicate technical relevance only and do not establish shared root causes across incidents."
@@ -227,6 +245,7 @@ class CrossIncidentEvidenceLinker:
                 substantive_count=0,
                 excluded_count=0,
                 limitations=group_limitations + ["No meaningful technical query terms could be derived from this symptom group."],
+                dataset_id=target_dataset_id,
             )
 
         # Build bounded query
@@ -234,38 +253,44 @@ class CrossIncidentEvidenceLinker:
         seen_chunk_ids: Set[str] = set()
         search_results: List[SearchResult] = []
 
-        try:
-            initial_results = self.retriever.search(query=query_str, limit=max_results)
-            for r in initial_results:
-                if r.chunk.chunk_id not in seen_chunk_ids:
-                    seen_chunk_ids.add(r.chunk.chunk_id)
-                    search_results.append(r)
-        except Exception:
-            pass
+        initial_results = self.retriever.search(
+            query=query_str,
+            limit=max_results,
+            dataset_id=target_dataset_id,
+            valid_dataset_ids=valid_dataset_ids,
+        )
+        for r in initial_results:
+            if r.chunk.chunk_id not in seen_chunk_ids:
+                seen_chunk_ids.add(r.chunk.chunk_id)
+                search_results.append(r)
 
         # If initial conjunction search yielded few results, also query key 2-term subqueries or individual terms
         if len(search_results) < max_results and len(query_terms) >= 2:
             # Query pairs like (terms[0], terms[1])
             pair_query = f"{query_terms[0]} {query_terms[1]}"
-            try:
-                pair_results = self.retriever.search(query=pair_query, limit=max_results)
-                for r in pair_results:
-                    if r.chunk.chunk_id not in seen_chunk_ids:
-                        seen_chunk_ids.add(r.chunk.chunk_id)
-                        search_results.append(r)
-            except Exception:
-                pass
+            pair_results = self.retriever.search(
+                query=pair_query,
+                limit=max_results,
+                dataset_id=target_dataset_id,
+                valid_dataset_ids=valid_dataset_ids,
+            )
+            for r in pair_results:
+                if r.chunk.chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(r.chunk.chunk_id)
+                    search_results.append(r)
 
         if len(search_results) < max_results and len(query_terms) > 0:
             for term in query_terms[:4]:
-                try:
-                    term_results = self.retriever.search(query=term, limit=3)
-                    for r in term_results:
-                        if r.chunk.chunk_id not in seen_chunk_ids:
-                            seen_chunk_ids.add(r.chunk.chunk_id)
-                            search_results.append(r)
-                except Exception:
-                    continue
+                term_results = self.retriever.search(
+                    query=term,
+                    limit=3,
+                    dataset_id=target_dataset_id,
+                    valid_dataset_ids=valid_dataset_ids,
+                )
+                for r in term_results:
+                    if r.chunk.chunk_id not in seen_chunk_ids:
+                        seen_chunk_ids.add(r.chunk.chunk_id)
+                        search_results.append(r)
 
         search_results = search_results[:max_results]
         raw_retrieved_count = len(search_results)
@@ -285,6 +310,7 @@ class CrossIncidentEvidenceLinker:
                 substantive_count=0,
                 excluded_count=0,
                 limitations=group_limitations + ["No matching evidence passages found in local index for derived query terms."],
+                dataset_id=target_dataset_id,
             )
 
         substantive_candidates: List[SymptomGroupEvidenceLink] = []
@@ -331,6 +357,7 @@ class CrossIncidentEvidenceLinker:
                 retrieval_score=round(sr.score, 3) if sr.score is not None else None,
                 matched_query_terms=sr.matched_terms,
                 provenance_limitations=prov_limits if prov_limits else None,
+                dataset_id=target_dataset_id,
             )
 
             if quality == PassageQuality.SUBSTANTIVE_TECHNICAL:
@@ -367,16 +394,29 @@ class CrossIncidentEvidenceLinker:
             substantive_count=len(deduped_substantive),
             excluded_count=len(excluded_candidates),
             limitations=group_limitations,
+            dataset_id=target_dataset_id,
         )
 
     def link_comparison_evidence(
         self,
         comparison_result: CrossIncidentComparisonResult,
         max_results_per_group: int = 8,
+        dataset_id: Optional[str] = None,
+        valid_dataset_ids: Optional[Iterable[str]] = None,
     ) -> CrossIncidentEvidenceLinkingResult:
         """
-        Execute cross-incident evidence linking across all symptom groups in a comparison result.
+        Execute cross-incident evidence linking across all symptom groups in a comparison result within dataset scope.
         """
+        target_dataset_id = self.retriever.require_dataset_scope(
+            dataset_id,
+            valid_dataset_ids,
+        )
+        if comparison_result.symptom_groups and comparison_result.dataset_id != target_dataset_id:
+            raise DatasetOwnershipError(
+                "Cross-incident evidence linking rejected a comparison result that is "
+                "unscoped or belongs to a different dataset."
+            )
+
         linking_id = f"EVLINK-{hashlib.sha256(str(current_iso_timestamp()).encode('utf-8')).hexdigest()[:12].upper()}"
 
         group_results: List[GroupEvidenceLinkResult] = []
@@ -384,7 +424,12 @@ class CrossIncidentEvidenceLinker:
         unsupported_count = 0
 
         for group in comparison_result.symptom_groups:
-            res = self.link_symptom_group(group, max_results=max_results_per_group)
+            res = self.link_symptom_group(
+                group,
+                max_results=max_results_per_group,
+                dataset_id=target_dataset_id,
+                valid_dataset_ids=valid_dataset_ids,
+            )
             group_results.append(res)
             if res.status == EvidenceLinkStatus.SUPPORTED:
                 supported_count += 1
@@ -417,4 +462,5 @@ class CrossIncidentEvidenceLinker:
             group_results=group_results,
             global_limitations=global_limitations,
             linked_at=current_iso_timestamp(),
+            dataset_id=target_dataset_id,
         )

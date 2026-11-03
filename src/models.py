@@ -1,5 +1,6 @@
 """Domain models and schema definitions for GhostFault evidence ingestion, retrieval, and fault analysis."""
 
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -102,6 +103,7 @@ class DocumentMetadata:
     extracted_character_count: int = 0
     error_code: Optional[str] = None
     error_message: Optional[str] = None
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize metadata to dictionary."""
@@ -133,6 +135,7 @@ class DocumentMetadata:
             extracted_character_count=int(data.get("extracted_character_count", 0)),
             error_code=data.get("error_code"),
             error_message=data.get("error_message"),
+            dataset_id=data.get("dataset_id"),
         )
 
 
@@ -153,6 +156,7 @@ class EvidenceChunk:
     end_offset: Optional[int]
     created_at: str
     content_hash: str
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize chunk to dictionary."""
@@ -173,6 +177,7 @@ class EvidenceChunk:
             end_offset=data.get("end_offset"),
             created_at=data["created_at"],
             content_hash=data["content_hash"],
+            dataset_id=data.get("dataset_id"),
         )
 
 
@@ -223,6 +228,7 @@ class EvidenceReference:
     duplicate_source_copies: Optional[List[Dict[str, str]]] = None
     is_excerpt: bool = False
     exclusion_reason: Optional[str] = None
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -367,6 +373,7 @@ class SymptomGroup:
     grouping_basis: str
     original_symptoms: List[Dict[str, str]]
     maintenance_actions: List[Dict[str, Optional[str]]]
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -399,6 +406,7 @@ class CrossIncidentComparisonResult:
     missing_fields_summary: Dict[str, int]
     limitations: List[ComparisonLimitation]
     compared_at: str
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -410,6 +418,7 @@ class CrossIncidentComparisonResult:
             "missing_fields_summary": self.missing_fields_summary,
             "limitations": [lim.to_dict() for lim in self.limitations],
             "compared_at": self.compared_at,
+            "dataset_id": self.dataset_id,
         }
 
 
@@ -450,6 +459,7 @@ class SymptomGroupEvidenceLink:
     retrieval_score: Optional[float] = None
     matched_query_terms: Optional[List[str]] = None
     provenance_limitations: Optional[List[str]] = None
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -481,6 +491,7 @@ class GroupEvidenceLinkResult:
     substantive_count: int
     excluded_count: int
     limitations: List[str]
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -497,6 +508,7 @@ class GroupEvidenceLinkResult:
             "substantive_count": self.substantive_count,
             "excluded_count": self.excluded_count,
             "limitations": self.limitations,
+            "dataset_id": self.dataset_id,
         }
 
 
@@ -513,6 +525,7 @@ class CrossIncidentEvidenceLinkingResult:
     group_results: List[GroupEvidenceLinkResult]
     global_limitations: List[ComparisonLimitation]
     linked_at: str
+    dataset_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -524,6 +537,89 @@ class CrossIncidentEvidenceLinkingResult:
             "group_results": [g.to_dict() for g in self.group_results],
             "global_limitations": [lim.to_dict() for lim in self.global_limitations],
             "linked_at": self.linked_at,
+            "dataset_id": self.dataset_id,
         }
 
 
+# ==============================================================================
+# Milestone 7.1 Models: Dataset Data Model
+# ==============================================================================
+
+DEFAULT_DATASET_ID = "DATASET-DEFAULT"
+DEFAULT_DATASET_NAME = "Default Dataset"
+DEFAULT_DATASET_DESCRIPTION = "Default system dataset containing legacy maintenance incidents and ingested evidence."
+
+
+class DatasetValidationError(ValueError):
+    """Raised when dataset parameters fail validation."""
+    pass
+
+
+class DatasetOwnershipError(ValueError):
+    """Raised when a record's dataset ownership is missing or unregistered."""
+
+
+@dataclass(frozen=True)
+class DatasetAssociationIssue:
+    """Read-only diagnostic for a missing or dangling dataset association."""
+
+    code: str
+    entity_type: str
+    entity_id: str
+    dataset_id: Optional[str]
+    message: str
+
+
+@dataclass
+class Dataset:
+    """
+    Structured representation of a maintenance dataset (Milestone 7.1).
+    Allows keeping different maintenance projects and their evidence separated.
+    """
+    dataset_id: str
+    name: str
+    created_at: str
+    description: Optional[str] = None
+
+    def __post_init__(self):
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate required fields and constraints."""
+        if not self.dataset_id or not str(self.dataset_id).strip():
+            raise DatasetValidationError("Dataset ID cannot be empty.")
+        if str(self.dataset_id) != str(self.dataset_id).strip():
+            raise DatasetValidationError("Dataset ID cannot contain surrounding whitespace.")
+        if not re.match(r"^[A-Za-z0-9_\-]+$", str(self.dataset_id)):
+            raise DatasetValidationError(
+                f"Dataset ID '{self.dataset_id}' contains invalid characters. "
+                "Only alphanumeric characters, underscores, and hyphens are allowed."
+            )
+        if not self.name or not str(self.name).strip():
+            raise DatasetValidationError("Dataset name cannot be empty.")
+        cleaned_name = str(self.name).strip()
+        if len(cleaned_name) < 2 or len(cleaned_name) > 100:
+            raise DatasetValidationError(
+                f"Dataset name must be between 2 and 100 characters. Given: {len(cleaned_name)}"
+            )
+        if not self.created_at or not str(self.created_at).strip():
+            raise DatasetValidationError("Dataset created_at timestamp cannot be empty.")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize dataset to dictionary."""
+        return {
+            "dataset_id": self.dataset_id,
+            "name": self.name,
+            "description": self.description,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Dataset":
+        """Deserialize dataset from dictionary."""
+        return cls(
+            dataset_id=data["dataset_id"],
+            name=data["name"],
+            description=data.get("description"),
+            created_at=data["created_at"],
+        )
