@@ -9,6 +9,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from src.data_loader import get_default_dataset_path, load_incidents_data
+from src.history import InvestigationHistoryStore
 from src.indexer import SearchIndex
 from src.hub import (
     NAV_HUB,
@@ -160,6 +161,13 @@ def test_actual_app_navigation_and_active_dataset_controls_are_consistent(
     st.cache_resource.clear()
     monkeypatch.setattr(EvidenceStore, "__init__", init_isolated_store)
     monkeypatch.setattr(SearchIndex, "__init__", init_isolated_index)
+
+    original_history_init = InvestigationHistoryStore.__init__
+
+    def init_isolated_history(self, db_path=None):
+        original_history_init(self, tmp_path / "history" / "investigation_history.db")
+
+    monkeypatch.setattr(InvestigationHistoryStore, "__init__", init_isolated_history)
     store = EvidenceStore()
     store.ensure_default_dataset()
     store.create_dataset("DATASET-CUSTOM", "Custom diagnostics")

@@ -17,18 +17,21 @@ Ghostvault/
 ├── data/
 │   ├── sample/
 │   │   └── incidents.csv    # Synthetic industrial maintenance incidents (CSV)
-│   └── evidence/            # [Runtime / Local only - Git ignored]
-│       ├── originals/       # Safe storage of raw uploaded files (<doc_id>_<safe_name>)
-│       ├── extracted/       # Extracted plain text UTF-8 files (<doc_id>.txt)
-│       ├── metadata/
-│       │   ├── catalog.json # Document catalog and dataset associations
-│       │   └── datasets.json # Persistent dataset registry
-│       └── index/
-│           └── evidence_index.db # SQLite FTS5 persistent full-text search index
+│   ├── evidence/            # [Runtime / Local only - Git ignored]
+│   │   ├── originals/       # Safe storage of raw uploaded files (<doc_id>_<safe_name>)
+│   │   ├── extracted/       # Extracted plain text UTF-8 files (<doc_id>.txt)
+│   │   ├── metadata/
+│   │   │   ├── catalog.json # Document catalog and dataset associations
+│   │   │   └── datasets.json # Persistent dataset registry
+│   │   └── index/
+│   │       └── evidence_index.db # SQLite FTS5 persistent full-text search index
+│   └── history/             # [Runtime / Local only - Git ignored]
+│       └── investigation_history.db # Versioned investigation snapshots and activity
 ├── src/
 │   ├── __init__.py
 │   ├── data_loader.py       # Incident dataset validation, relative loading, and filtering
 │   ├── hub.py               # Project summaries, dataset state, integrity, and navigation
+│   ├── history.py           # Dataset-scoped persistent investigation history and activity
 │   ├── models.py            # Typed domain models (Incidents, Chunks, SearchResults, Hypotheses, Scopes)
 │   ├── extractor.py         # Isolated text extraction for TXT and PDF (pypdf)
 │   ├── storage.py           # Atomic writes, path traversal sanitization, and catalog management
@@ -51,6 +54,7 @@ Ghostvault/
     ├── test_dataset_isolation.py # Dataset-scoping regression tests
     ├── test_dataset_ownership.py # Ownership validation across registry, catalog, and index
     ├── test_dataset_retrieval.py # Strict dataset-scoped evidence retrieval
+    ├── test_investigation_history.py # Persistent history, activity, and dataset isolation
     └── test_m7_3_stabilization.py # Navigation, UI state, and integrity regressions
 ```
 
@@ -97,6 +101,14 @@ Ghostvault/
   - **Empty / Low-Substance**: Fragmentary tokens too brief to convey diagnostic facts.
 - Low-value passages are transparently displayed under an "Excluded or Low-Value Retrieval Results" diagnostic section with the specific reason for exclusion.
 - If all retrieved passages are non-substantive, the system returns `INSUFFICIENT_EVIDENCE` with zero hypotheses.
+
+### Investigation History & Activity
+- Fault-analysis results are saved as immutable incident and analysis snapshots in the separate `data/history/investigation_history.db` database.
+- History reads and writes require a currently registered dataset and exact incident/result dataset ownership.
+- Unique run IDs make persistence idempotent across Streamlit reruns; each saved run has one transactional activity event.
+- Opening an old investigation displays the saved snapshot and never reruns analysis.
+- The Central Intelligence Hub combines persisted investigation activity with evidence-ingestion timestamps; detailed history remains scoped to the active dataset.
+- The history database has its own schema version and does not change the schema-v3 evidence search index or incidents CSV.
 
 ### Transparent Pipeline Metrics
 - Dashboard displays five separately derived counts (not invented — computed from actual pipeline results):

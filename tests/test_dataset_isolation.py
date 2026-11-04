@@ -715,6 +715,7 @@ def test_switching_active_dataset_invalidates_cached_analysis_results():
         "active_dataset_id": "DATASET-A",
         "analysis_result_INC-1_DATASET-A": object(),
         "analysis_result_INC-2_DATASET-B": object(),
+        "investigation_run_id_INC-1_DATASET-A": "pending-run",
         "unrelated_state": "preserved",
     }
 
@@ -728,6 +729,7 @@ def test_switching_active_dataset_invalidates_cached_analysis_results():
     assert error is None
     assert state["active_dataset_id"] == "DATASET-B"
     assert not any(key.startswith("analysis_result_") for key in state)
+    assert not any(key.startswith("investigation_run_id_") for key in state)
     assert state["unrelated_state"] == "preserved"
 
 

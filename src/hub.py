@@ -279,6 +279,28 @@ def compute_recent_documents(
     return recent
 
 
+def compute_recent_investigation_activity(
+    history_store: Any,
+    evidence_store: EvidenceStore,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Aggregate recent activity by querying each registered dataset separately."""
+    events: List[Dict[str, Any]] = []
+    for dataset in evidence_store.list_datasets():
+        events.extend(
+            history_store.list_activity(
+                evidence_store,
+                dataset.dataset_id,
+                limit=limit,
+            )
+        )
+    events.sort(
+        key=lambda event: (event["occurred_at"], event["event_id"]),
+        reverse=True,
+    )
+    return events[:limit]
+
+
 # ==============================================================================
 # Navigation Targets (Milestone 7.2 & 7.3)
 # ==============================================================================
@@ -291,6 +313,7 @@ NAV_EVIDENCE_INGESTION = "Evidence Ingestion"
 NAV_EVIDENCE_SEARCH = "Evidence Search"
 NAV_FAULT_ANALYSIS = "Fault Analysis"
 NAV_CROSS_INCIDENT = "Cross-Incident Analysis"
+NAV_INVESTIGATION_HISTORY = "Investigation History & Activity"
 
 NAVIGATION_PAGES = [
     NAV_HUB,
@@ -300,6 +323,7 @@ NAVIGATION_PAGES = [
     NAV_EVIDENCE_SEARCH,
     NAV_FAULT_ANALYSIS,
     NAV_CROSS_INCIDENT,
+    NAV_INVESTIGATION_HISTORY,
 ]
 
 
@@ -426,8 +450,12 @@ def set_active_dataset_id(
     previous_id = session_state.get(SESSION_KEY_ACTIVE_DATASET)
     if previous_id and previous_id != clean_id:
         for key in list(session_state.keys()):
-            if isinstance(key, str) and key.startswith("analysis_result_"):
+            if isinstance(key, str) and (
+                key.startswith("analysis_result_")
+                or key.startswith("investigation_run_id_")
+            ):
                 del session_state[key]
+        session_state.pop("selected_investigation_run_id", None)
     session_state[SESSION_KEY_ACTIVE_DATASET] = clean_id
     return True, None
 

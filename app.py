@@ -12,6 +12,9 @@ Includes:
 import streamlit as st
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
+import sqlite3
+import uuid
 from typing import Optional, Dict, Any, List
 
 from src.data_loader import (
@@ -46,6 +49,7 @@ from src.retriever import EvidenceRetriever
 from src.analyzer import FaultAnalysisEngine
 from src.cross_incident import CrossIncidentComparisonEngine, generate_incident_timeline
 from src.evidence_linker import CrossIncidentEvidenceLinker
+from src.history import HistoryStoreError, InvestigationHistoryStore
 from src.hub import (
     compute_project_summary,
     compute_dataset_registry,
@@ -53,6 +57,7 @@ from src.hub import (
     compute_incident_overview,
     compute_evidence_summary,
     compute_recent_documents,
+    compute_recent_investigation_activity,
     compute_workspace_summary,
     resolve_active_dataset,
     set_active_dataset_id,
@@ -73,6 +78,7 @@ from src.hub import (
     NAV_EVIDENCE_SEARCH,
     NAV_FAULT_ANALYSIS,
     NAV_CROSS_INCIDENT,
+    NAV_INVESTIGATION_HISTORY,
 )
 
 
@@ -331,6 +337,12 @@ def get_search_components() -> tuple[SearchIndex, EvidenceRetriever, FaultAnalys
     comparison_engine = CrossIncidentComparisonEngine(store=EvidenceStore())
     evidence_linker = CrossIncidentEvidenceLinker(retriever)
     return index, retriever, analyzer, comparison_engine, evidence_linker
+
+
+@st.cache_resource
+def get_investigation_history_store() -> InvestigationHistoryStore:
+    """Initialize and cache the separate persistent investigation history store."""
+    return InvestigationHistoryStore()
 
 
 def render_evidence_ingestion(
@@ -695,6 +707,8 @@ def render_fault_analysis(
     analyzer: FaultAnalysisEngine,
     selected_record: Optional[pd.Series],
     active_dataset: Optional[Dataset] = None,
+    history_store: Optional[InvestigationHistoryStore] = None,
+    evidence_store: Optional[EvidenceStore] = None,
 ) -> None:
     """Render Milestone 4.1.2 Evidence-Grounded Fault Analysis interface."""
     st.subheader("🧠 Evidence-Grounded Fault Analysis")
@@ -722,6 +736,7 @@ def render_fault_analysis(
     target_ds_id = active_dataset.dataset_id
 
     analysis_key = f"analysis_result_{incident_id}_{target_ds_id}"
+    run_id_key = f"investigation_run_id_{incident_id}_{target_ds_id}"
 
     btn_col, status_col = st.columns([2, 5])
     with btn_col:
@@ -729,6 +744,7 @@ def render_fault_analysis(
 
     if run_analysis or analysis_key in st.session_state:
         if run_analysis:
+            st.session_state[run_id_key] = str(uuid.uuid4())
             with st.spinner("Analyzing incident symptoms against retrieved evidence corpus..."):
                 try:
                     analysis_result = analyzer.analyze_incident(
@@ -738,10 +754,35 @@ def render_fault_analysis(
                 except DatasetOwnershipError as exc:
                     st.error(f"Fault analysis was not performed: {exc}")
                     st.session_state.pop(analysis_key, None)
+                    st.session_state.pop(run_id_key, None)
                     return
                 st.session_state[analysis_key] = analysis_result
         else:
             analysis_result = st.session_state[analysis_key]
+
+        if history_store is None or evidence_store is None:
+            st.error("Investigation history storage is unavailable; the analysis was not saved.")
+        else:
+            run_id = st.session_state.get(run_id_key)
+            if not run_id:
+                run_id = str(uuid.uuid4())
+                st.session_state[run_id_key] = run_id
+            persisted_key = f"investigation_history_saved_{run_id}"
+            if not st.session_state.get(persisted_key):
+                try:
+                    saved = history_store.save_run(
+                        evidence_store,
+                        run_id,
+                        target_ds_id,
+                        incident_dict,
+                        analysis_result,
+                    )
+                except (HistoryStoreError, DatasetOwnershipError, sqlite3.Error) as exc:
+                    st.error(f"Investigation result could not be saved to history: {exc}")
+                else:
+                    st.session_state[persisted_key] = True
+                    if saved["created"]:
+                        st.success("Investigation snapshot saved to history.")
 
         with status_col:
             if analysis_result.status == AnalysisStatus.COMPLETED:
@@ -1492,10 +1533,125 @@ def render_dataset_workspace(
             )
 
 
+def render_investigation_history(
+    history_store: InvestigationHistoryStore,
+    evidence_store: EvidenceStore,
+    active_dataset: Optional[Dataset],
+) -> None:
+    """Display saved investigation snapshots and activity for the active dataset."""
+    st.subheader("Investigation History & Activity")
+    if active_dataset is None:
+        st.error("Investigation history requires a registered active dataset.")
+        return
+
+    dataset_id = active_dataset.dataset_id
+    st.info(
+        f"History is restricted to **{active_dataset.name}** (`{dataset_id}`). "
+        "Opening a record displays its saved snapshot and never reruns analysis."
+    )
+    runs = history_store.list_runs(evidence_store, dataset_id, limit=500)
+    if not runs:
+        st.info("No investigations have been saved for this dataset.")
+    else:
+        statuses = ["All statuses"] + sorted({run["status"] for run in runs})
+        filter_col, date_col = st.columns(2)
+        with filter_col:
+            selected_status = st.selectbox(
+                "Filter by status",
+                options=statuses,
+                key=f"history_status_{dataset_id}",
+            )
+        run_dates = [
+            datetime.fromisoformat(run["analyzed_at"].replace("Z", "+00:00")).date()
+            for run in runs
+        ]
+        with date_col:
+            selected_dates = st.date_input(
+                "Filter by date",
+                value=(min(run_dates), max(run_dates)),
+                key=f"history_dates_{dataset_id}",
+            )
+        if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
+            start_date = selected_dates[0] or min(run_dates)
+            end_date = selected_dates[1] or max(run_dates)
+        else:
+            start_date = end_date = selected_dates
+        filtered_runs = [
+            run
+            for run in runs
+            if (selected_status == "All statuses" or run["status"] == selected_status)
+            and start_date
+            <= datetime.fromisoformat(
+                run["analyzed_at"].replace("Z", "+00:00")
+            ).date()
+            <= end_date
+        ]
+        if filtered_runs:
+            st.dataframe(
+                [
+                    {
+                        "Run time (UTC)": run["analyzed_at"][:19].replace("T", " "),
+                        "Incident": run["incident_id"],
+                        "Status": run["status"],
+                        "Run ID": run["run_id"],
+                    }
+                    for run in filtered_runs
+                ],
+                hide_index=True,
+            )
+            selected_run_id = st.selectbox(
+                "Open saved investigation",
+                options=[run["run_id"] for run in filtered_runs],
+                format_func=lambda run_id: next(
+                    (
+                        f"{run['incident_id']} — {run['status']} — "
+                        f"{run['analyzed_at'][:19].replace('T', ' ')}"
+                        for run in filtered_runs
+                        if run["run_id"] == run_id
+                    ),
+                    run_id,
+                ),
+                key=f"history_run_{dataset_id}",
+            )
+            saved_run = history_store.get_run(
+                evidence_store,
+                dataset_id,
+                selected_run_id,
+            )
+            if saved_run is None:
+                st.warning("The selected investigation is no longer available in this dataset.")
+            else:
+                st.markdown("#### Saved incident snapshot")
+                st.json(saved_run["incident_snapshot"])
+                st.markdown("#### Saved analysis result")
+                st.json(saved_run["result"])
+        else:
+            st.info("No saved investigations match the selected filters.")
+
+    st.markdown("---")
+    st.markdown("#### Dataset activity")
+    events = history_store.list_activity(evidence_store, dataset_id, limit=100)
+    if events:
+        st.dataframe(
+            [
+                {
+                    "Time (UTC)": event["occurred_at"][:19].replace("T", " "),
+                    "Activity": event["summary"],
+                    "Run ID": event["entity_id"],
+                }
+                for event in events
+            ],
+            hide_index=True,
+        )
+    else:
+        st.info("No investigation activity has been recorded for this dataset.")
+
+
 def render_central_hub(
     store: EvidenceStore,
     incidents_df: Optional[pd.DataFrame],
     active_dataset: Optional[Dataset] = None,
+    history_store: Optional[InvestigationHistoryStore] = None,
 ) -> None:
     """Render the M7.2 Central Intelligence Hub: project overview, dataset registry, and navigation."""
 
@@ -1770,33 +1926,70 @@ def render_central_hub(
     # --- SECTION 4: Recent Activity ---
     st.markdown("#### 🕐 Project-Wide Recent Activity")
 
-    recent_docs = compute_recent_documents(documents, limit=5)
-    if recent_docs:
-        st.caption("Most recently ingested evidence documents across the entire project (based on persisted timestamps):")
-        recent_table = []
-        for rd in recent_docs:
-            recent_table.append({
-                "Document ID": rd["document_id"],
-                "Filename": rd["original_filename"],
-                "Type": rd["file_type"],
-                "Status": rd["status"],
-                "Ingested At": rd["created_at"],
-                "Dataset": rd["dataset_id"],
-            })
+    recent_docs = compute_recent_documents(documents, limit=len(documents))
+    document_timestamps = {
+        document.document_id: document.created_at
+        for document in documents
+    }
+    recent_events = (
+        compute_recent_investigation_activity(history_store, store, limit=10)
+        if history_store is not None
+        else []
+    )
+    activity_rows = [
+        {
+            "time": document_timestamps.get(
+                document["document_id"],
+                document["created_at"],
+            ),
+            "activity": f"Evidence ingestion ({document['status']})",
+            "entity": document["original_filename"],
+            "dataset": document["dataset_id"],
+        }
+        for document in recent_docs
+    ]
+    activity_rows.extend(
+        {
+            "time": event["occurred_at"],
+            "activity": event["summary"],
+            "entity": event["entity_id"],
+            "dataset": event["dataset_id"],
+        }
+        for event in recent_events
+    )
+
+    def activity_timestamp(row: Dict[str, Any]) -> float:
+        try:
+            return datetime.fromisoformat(row["time"].replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError, OSError):
+            return 0.0
+
+    activity_rows.sort(key=activity_timestamp, reverse=True)
+    if activity_rows:
+        st.caption(
+            "Recent evidence ingestion timestamps and persisted investigation activity "
+            "across registered datasets."
+        )
+        recent_table = [
+            {
+                "Time": row["time"][:19].replace("T", " "),
+                "Activity": row["activity"],
+                "Record": row["entity"],
+                "Dataset": row["dataset"],
+            }
+            for row in activity_rows[:10]
+        ]
         st.dataframe(
             pd.DataFrame(recent_table),
             use_container_width=True,
             hide_index=True,
         )
     else:
-        st.info(
-            "No evidence documents have been ingested yet. "
-            "Navigate to **Evidence Ingestion** to upload maintenance documents."
-        )
+        st.info("No evidence ingestion or investigation activity has been recorded yet.")
 
     st.caption(
-        "ℹ️ A comprehensive activity log with investigation history tracking "
-        "is planned for a future milestone. Current activity is limited to persisted document ingestion timestamps."
+        "Project-wide activity is summarized here. Open Investigation History & Activity "
+        "to review saved analysis snapshots within the active dataset."
     )
 
     st.markdown("---")
@@ -1861,6 +2054,16 @@ def render_central_hub(
             )
 
         with st.container(border=True):
+            st.markdown("**🗂️ Investigation History & Activity**")
+            st.caption("Review saved analysis snapshots within the active dataset.")
+            st.button(
+                "Open Investigation History",
+                key="hub_nav_history",
+                on_click=navigate_to,
+                args=(NAV_INVESTIGATION_HISTORY,),
+            )
+
+        with st.container(border=True):
             st.markdown("**🔗 Cross-Incident Analysis**")
             st.caption("Compare symptom patterns and evidence links across incidents.")
             st.button(
@@ -1893,6 +2096,7 @@ def main() -> None:
     # --- Initialize Components and Storage ---
     ingestion_service = get_ingestion_service()
     search_index, retriever, analyzer, comparison_engine, evidence_linker = get_search_components()
+    history_store = get_investigation_history_store()
 
     # Ensure default dataset exists and load registry
     ingestion_service.store.ensure_default_dataset()
@@ -1922,8 +2126,12 @@ def main() -> None:
     ]
     if current_active_id != resolved_active_id:
         for key in list(st.session_state.keys()):
-            if isinstance(key, str) and key.startswith("analysis_result_"):
+            if isinstance(key, str) and (
+                key.startswith("analysis_result_")
+                or key.startswith("investigation_run_id_")
+            ):
                 del st.session_state[key]
+        st.session_state.pop("selected_investigation_run_id", None)
     st.session_state["active_dataset_id"] = resolved_active_id
     st.session_state["active_dataset_selector_widget"] = resolved_active_id
 
@@ -2012,7 +2220,12 @@ def main() -> None:
 
     # --- Page Routing ---
     if selected_page == NAV_HUB:
-        render_central_hub(ingestion_service.store, raw_df, active_dataset=active_dataset)
+        render_central_hub(
+            ingestion_service.store,
+            raw_df,
+            active_dataset=active_dataset,
+            history_store=history_store,
+        )
 
     elif selected_page == NAV_WORKSPACE:
         render_dataset_workspace(
@@ -2128,7 +2341,13 @@ def main() -> None:
                 f"contains 0 maintenance incidents. To analyze faults, either switch to a dataset with registered incidents "
                 f"(such as **Default Dataset**) or register incidents in this dataset. Cross-dataset incident borrowing is strictly disabled to preserve isolation."
             )
-            render_fault_analysis(analyzer, None, active_dataset=active_dataset)
+            render_fault_analysis(
+                analyzer,
+                None,
+                active_dataset=active_dataset,
+                history_store=history_store,
+                evidence_store=ingestion_service.store,
+            )
         else:
             if not filtered_df.empty:
                 available_ids = filtered_df["incident_id"].tolist()
@@ -2153,7 +2372,13 @@ def main() -> None:
                             st.caption("Symptom")
                             st.markdown(f"*{selected_record['symptom']}*")
 
-            render_fault_analysis(analyzer, selected_record, active_dataset=active_dataset)
+            render_fault_analysis(
+                analyzer,
+                selected_record,
+                active_dataset=active_dataset,
+                history_store=history_store,
+                evidence_store=ingestion_service.store,
+            )
 
     elif selected_page == NAV_CROSS_INCIDENT:
         render_cross_incident_analysis(
@@ -2161,6 +2386,13 @@ def main() -> None:
             comparison_engine,
             evidence_linker,
             active_dataset=active_dataset,
+        )
+
+    elif selected_page == NAV_INVESTIGATION_HISTORY:
+        render_investigation_history(
+            history_store,
+            ingestion_service.store,
+            active_dataset,
         )
 
 

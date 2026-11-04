@@ -24,6 +24,7 @@ secrets/
 
 # Runtime evidence and ingested documents (preserve data/sample)
 data/evidence/
+data/history/
 
 # IDE / Editor artifacts
 .vscode/
