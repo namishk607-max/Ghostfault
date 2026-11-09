@@ -623,3 +623,221 @@ class Dataset:
             description=data.get("description"),
             created_at=data["created_at"],
         )
+
+
+class CaseStatus(str, Enum):
+    """Lifecycle status for an investigation follow-up case (Milestone 8)."""
+    OPEN = "open"
+    IN_REVIEW = "in_review"
+    ACTION_TAKEN = "action_taken"
+    RESOLVED = "resolved"
+    CLOSED = "closed"
+
+
+class CasePriority(str, Enum):
+    """Urgency / priority of an investigation case."""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class InspectionType(str, Enum):
+    """Categorization of physical maintenance follow-up inspections."""
+    PHYSICAL_DISASSEMBLY = "physical_disassembly"
+    VIBRATION_CHECK = "vibration_check"
+    THERMAL_SCAN = "thermal_scan"
+    LUBRICANT_ANALYSIS = "lubricant_analysis"
+    OPERATIONAL_TEST = "operational_test"
+
+
+class HypothesisDetermination(str, Enum):
+    """Outcome determination comparing hypothesis against physical teardown/inspection."""
+    VERIFIED_CORRECT = "verified_correct"
+    PARTIALLY_CORRECT = "partially_correct"
+    INCORRECT = "incorrect"
+    INCONCLUSIVE = "inconclusive"
+
+
+class OutcomeConfidence(str, Enum):
+    """Confidence level in the hypothesis outcome determination."""
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+@dataclass
+class InvestigationCase:
+    """Follow-up case tracking physical outcome and resolution for an investigation run."""
+    case_id: str
+    dataset_id: str
+    incident_id: str
+    run_id: str
+    status: CaseStatus
+    title: str
+    priority: CasePriority
+    created_at: str
+    updated_at: str
+    closed_at: Optional[str] = None
+    closure_summary: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "dataset_id": self.dataset_id,
+            "incident_id": self.incident_id,
+            "run_id": self.run_id,
+            "status": self.status.value if isinstance(self.status, CaseStatus) else self.status,
+            "title": self.title,
+            "priority": self.priority.value if isinstance(self.priority, CasePriority) else self.priority,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "closed_at": self.closed_at,
+            "closure_summary": self.closure_summary,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "InvestigationCase":
+        raw_status = data.get("status", CaseStatus.OPEN.value)
+        try:
+            status = CaseStatus(raw_status)
+        except ValueError:
+            status = CaseStatus.OPEN
+
+        raw_priority = data.get("priority", CasePriority.MEDIUM.value)
+        try:
+            priority = CasePriority(raw_priority)
+        except ValueError:
+            priority = CasePriority.MEDIUM
+
+        return cls(
+            case_id=data["case_id"],
+            dataset_id=data["dataset_id"],
+            incident_id=data["incident_id"],
+            run_id=data["run_id"],
+            status=status,
+            title=data["title"],
+            priority=priority,
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+            closed_at=data.get("closed_at"),
+            closure_summary=data.get("closure_summary"),
+        )
+
+
+@dataclass
+class CaseInspection:
+    """Physical maintenance inspection record logged for an investigation case."""
+    inspection_id: str
+    case_id: str
+    dataset_id: str
+    inspected_at: str
+    inspector_name: str
+    inspection_type: InspectionType
+    observations: str
+    physical_action_taken: str
+    parts_replaced: List[str]
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "inspection_id": self.inspection_id,
+            "case_id": self.case_id,
+            "dataset_id": self.dataset_id,
+            "inspected_at": self.inspected_at,
+            "inspector_name": self.inspector_name,
+            "inspection_type": (
+                self.inspection_type.value
+                if isinstance(self.inspection_type, InspectionType)
+                else self.inspection_type
+            ),
+            "observations": self.observations,
+            "physical_action_taken": self.physical_action_taken,
+            "parts_replaced": list(self.parts_replaced or []),
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CaseInspection":
+        raw_type = data.get("inspection_type", InspectionType.PHYSICAL_DISASSEMBLY.value)
+        try:
+            inspection_type = InspectionType(raw_type)
+        except ValueError:
+            inspection_type = InspectionType.PHYSICAL_DISASSEMBLY
+
+        return cls(
+            inspection_id=data["inspection_id"],
+            case_id=data["case_id"],
+            dataset_id=data["dataset_id"],
+            inspected_at=data["inspected_at"],
+            inspector_name=data["inspector_name"],
+            inspection_type=inspection_type,
+            observations=data.get("observations", ""),
+            physical_action_taken=data.get("physical_action_taken", ""),
+            parts_replaced=list(data.get("parts_replaced") or []),
+            created_at=data["created_at"],
+        )
+
+
+@dataclass
+class CaseHypothesisOutcome:
+    """Outcome determination and ground-truth evaluation for a diagnostic hypothesis."""
+    outcome_id: str
+    case_id: str
+    dataset_id: str
+    hypothesis_id: str
+    failure_mode: str
+    determination: HypothesisDetermination
+    confidence: OutcomeConfidence
+    notes: str
+    determined_at: str
+    determined_by: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "outcome_id": self.outcome_id,
+            "case_id": self.case_id,
+            "dataset_id": self.dataset_id,
+            "hypothesis_id": self.hypothesis_id,
+            "failure_mode": self.failure_mode,
+            "determination": (
+                self.determination.value
+                if isinstance(self.determination, HypothesisDetermination)
+                else self.determination
+            ),
+            "confidence": (
+                self.confidence.value
+                if isinstance(self.confidence, OutcomeConfidence)
+                else self.confidence
+            ),
+            "notes": self.notes,
+            "determined_at": self.determined_at,
+            "determined_by": self.determined_by,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CaseHypothesisOutcome":
+        raw_det = data.get("determination", HypothesisDetermination.INCONCLUSIVE.value)
+        try:
+            det = HypothesisDetermination(raw_det)
+        except ValueError:
+            det = HypothesisDetermination.INCONCLUSIVE
+
+        raw_conf = data.get("confidence", OutcomeConfidence.MEDIUM.value)
+        try:
+            conf = OutcomeConfidence(raw_conf)
+        except ValueError:
+            conf = OutcomeConfidence.MEDIUM
+
+        return cls(
+            outcome_id=data["outcome_id"],
+            case_id=data["case_id"],
+            dataset_id=data["dataset_id"],
+            hypothesis_id=data["hypothesis_id"],
+            failure_mode=data.get("failure_mode", ""),
+            determination=det,
+            confidence=conf,
+            notes=data.get("notes", ""),
+            determined_at=data["determined_at"],
+            determined_by=data.get("determined_by", ""),
+        )

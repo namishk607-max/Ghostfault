@@ -56,7 +56,7 @@ def test_history_schema_is_versioned_and_separate_from_evidence_index(history_co
         evidence_store.base_dir / "index" / "evidence_index.db"
     )
     with sqlite3.connect(history_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == InvestigationHistoryStore.SCHEMA_VERSION
         tables = {
             row[0]
             for row in connection.execute(

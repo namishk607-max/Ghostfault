@@ -342,6 +342,11 @@ def get_search_components() -> tuple[SearchIndex, EvidenceRetriever, FaultAnalys
 @st.cache_resource
 def get_investigation_history_store() -> InvestigationHistoryStore:
     """Initialize and cache the separate persistent investigation history store."""
+    import os
+    env_history_db = os.environ.get("GHOSTFAULT_HISTORY_DB")
+    if env_history_db:
+        allow_mig = os.environ.get("GHOSTFAULT_ALLOW_MIGRATION", "").lower() in ("1", "true", "yes")
+        return InvestigationHistoryStore(Path(env_history_db), allow_migration=allow_mig)
     return InvestigationHistoryStore()
 
 
@@ -1625,6 +1630,48 @@ def render_investigation_history(
                 st.json(saved_run["incident_snapshot"])
                 st.markdown("#### Saved analysis result")
                 st.json(saved_run["result"])
+
+                # Milestone 8: Follow-up Case Tracking Section
+                st.markdown("---")
+                st.markdown("### 📋 Investigation Case & Outcome Tracking (M8)")
+                existing_case = history_store.get_case_by_run_id(
+                    evidence_store, dataset_id, selected_run_id
+                )
+                if existing_case is None:
+                    st.info("No follow-up case has been opened for this investigation run yet.")
+                    with st.expander("➕ Open Follow-Up Case for this Investigation", expanded=False):
+                        with st.form(key=f"create_case_form_{selected_run_id}"):
+                            default_title = f"Case for {saved_run['incident_id']} - {saved_run['incident_snapshot'].get('symptom', 'Inspection')}"
+                            c_title = st.text_input("Case Title", value=default_title)
+                            c_priority = st.selectbox(
+                                "Priority",
+                                options=["medium", "high", "critical", "low"],
+                                index=0,
+                            )
+                            c_by = st.text_input("Opened By", value="Reliability Engineer")
+                            submit_case = st.form_submit_button("Create Case")
+                            if submit_case:
+                                try:
+                                    created_case = history_store.create_case(
+                                        evidence_store,
+                                        dataset_id,
+                                        selected_run_id,
+                                        title=c_title,
+                                        priority=c_priority,
+                                        created_by=c_by,
+                                    )
+                                    st.success(f"✅ Case `{created_case['case_id']}` created successfully!")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Failed to create case: {exc}")
+                else:
+                    render_case_detail_panel(
+                        history_store,
+                        evidence_store,
+                        dataset_id,
+                        existing_case,
+                        saved_run,
+                    )
         else:
             st.info("No saved investigations match the selected filters.")
 
@@ -1645,6 +1692,193 @@ def render_investigation_history(
         )
     else:
         st.info("No investigation activity has been recorded for this dataset.")
+
+
+def render_case_detail_panel(
+    history_store: InvestigationHistoryStore,
+    evidence_store: EvidenceStore,
+    dataset_id: str,
+    case_data: Dict[str, Any],
+    saved_run: Dict[str, Any],
+) -> None:
+    """Render the full interactive detail panel for an M8 investigation case."""
+    case_id = case_data["case_id"]
+    status_str = case_data["status"]
+    status_badge = {
+        "open": "🔵 OPEN",
+        "in_review": "🟡 IN REVIEW",
+        "action_taken": "🟠 ACTION TAKEN",
+        "resolved": "🟢 RESOLVED",
+        "closed": "⚪ CLOSED",
+    }.get(status_str, status_str.upper())
+
+    with st.container(border=True):
+        c_top1, c_top2, c_top3 = st.columns(3)
+        with c_top1:
+            st.caption("Case ID")
+            st.markdown(f"**`{case_id}`**")
+        with c_top2:
+            st.caption("Status")
+            st.markdown(f"**{status_badge}**")
+        with c_top3:
+            st.caption("Priority")
+            st.markdown(f"**{case_data['priority'].upper()}**")
+
+        st.markdown(f"**Title:** {case_data['title']}")
+        st.caption(f"Created: {case_data['created_at'][:19].replace('T', ' ')} UTC | Last Updated: {case_data['updated_at'][:19].replace('T', ' ')} UTC")
+        if case_data.get("closure_summary"):
+            st.info(f"**Closure Summary:** {case_data['closure_summary']}")
+
+    # 1. Independent Hypothesis Outcome Determinations
+    st.markdown("#### 🔍 Diagnostic Hypotheses & Physical Outcome Verification")
+    hypotheses = saved_run["result"].get("hypotheses", [])
+    if not hypotheses:
+        st.info("No diagnostic hypotheses were generated in this investigation run.")
+    else:
+        existing_outcomes = {o["hypothesis_id"]: o for o in case_data.get("hypothesis_outcomes", [])}
+        for idx, hyp in enumerate(hypotheses, 1):
+            h_id = hyp.get("hypothesis_id", f"HYP-{idx}")
+            f_mode = hyp.get("failure_mode", f"Failure Mode {idx}")
+            with st.container(border=True):
+                st.markdown(f"**Hypothesis {idx}: {f_mode}** (`{h_id}`)")
+                st.markdown(f"*Mechanism / Rationale:* {hyp.get('mechanism', 'N/A')}")
+                outcome_rec = existing_outcomes.get(h_id)
+                if outcome_rec:
+                    st.success(
+                        f"**Outcome Determination:** `{outcome_rec['determination'].upper()}` | "
+                        f"Confidence: `{outcome_rec['confidence'].upper()}` | "
+                        f"Evaluated By: {outcome_rec['determined_by']} ({outcome_rec['determined_at'][:19].replace('T', ' ')} UTC)\n\n"
+                        f"*Teardown Notes:* {outcome_rec['notes']}"
+                    )
+                else:
+                    st.warning("⚠️ Outcome not yet determined by physical inspection.")
+
+                with st.expander(f"Record / Update Outcome for {f_mode}", expanded=False):
+                    with st.form(key=f"outcome_form_{case_id}_{h_id}"):
+                        det = st.selectbox(
+                            "Determination",
+                            options=["verified_correct", "partially_correct", "incorrect", "inconclusive"],
+                            index=0,
+                        )
+                        conf = st.selectbox("Confidence", options=["high", "medium", "low"], index=0)
+                        notes = st.text_area("Teardown & Verification Notes", placeholder="Describe physical findings...")
+                        eval_by = st.text_input("Evaluator", value="Reliability Engineer")
+                        save_out = st.form_submit_button("Record Outcome")
+                        if save_out:
+                            try:
+                                history_store.record_hypothesis_outcome(
+                                    evidence_store,
+                                    dataset_id,
+                                    case_id,
+                                    hypothesis_id=h_id,
+                                    failure_mode=f_mode,
+                                    determination=det,
+                                    confidence=conf,
+                                    notes=notes,
+                                    determined_by=eval_by,
+                                )
+                                st.success("Outcome recorded successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error recording outcome: {e}")
+
+    # 2. Append-Only Physical Maintenance & Inspection Log
+    st.markdown("#### 🛠️ Physical Maintenance & Inspection Logs (Shop-Floor Observations)")
+    st.caption("Technician observations are strictly separated from verified document evidence.")
+    inspections = case_data.get("inspections", [])
+    if inspections:
+        for insp in inspections:
+            with st.container(border=True):
+                st.markdown(
+                    f"**Inspection:** `{insp['inspection_type'].upper()}` on {insp['inspected_at'][:10]} "
+                    f"by **{insp['inspector_name']}**"
+                )
+                st.markdown(f"**Observations:** {insp['observations']}")
+                if insp['physical_action_taken']:
+                    st.markdown(f"**Physical Action Taken:** {insp['physical_action_taken']}")
+                if insp.get("parts_replaced"):
+                    st.markdown(f"**Parts Replaced:** {', '.join(insp['parts_replaced'])}")
+    else:
+        st.info("No physical maintenance inspections logged for this case yet.")
+
+    with st.expander("➕ Log New Maintenance Inspection", expanded=False):
+        with st.form(key=f"log_inspection_form_{case_id}"):
+            i_inspector = st.text_input("Inspector Name", value="Field Technician")
+            i_type = st.selectbox(
+                "Inspection Type",
+                options=[
+                    "physical_disassembly",
+                    "vibration_check",
+                    "thermal_scan",
+                    "lubricant_analysis",
+                    "operational_test",
+                ],
+            )
+            i_obs = st.text_area("Shop-Floor Observations (Unverified User Input)", placeholder="Observed wear, debris, clearance...")
+            i_action = st.text_input("Physical Action Taken", placeholder="e.g. Replaced inner bearing race...")
+            i_parts = st.text_input("Parts Replaced (comma-separated)", placeholder="e.g. BRG-6205, SEAL-30X52X7")
+            submit_insp = st.form_submit_button("Log Inspection")
+            if submit_insp:
+                parts_arr = [p.strip() for p in i_parts.split(",") if p.strip()] if i_parts else []
+                try:
+                    history_store.log_inspection(
+                        evidence_store,
+                        dataset_id,
+                        case_id,
+                        inspector_name=i_inspector,
+                        inspection_type=i_type,
+                        observations=i_obs,
+                        physical_action_taken=i_action,
+                        parts_replaced=parts_arr,
+                    )
+                    st.success("Inspection logged successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to log inspection: {e}")
+
+    # 3. Case Status Transition Rules & Lifecycle Ledger
+    st.markdown("#### 🔄 Case Lifecycle & Status Transitions")
+    with st.expander("Update Case Status / Reopen Case", expanded=False):
+        with st.form(key=f"status_transition_form_{case_id}"):
+            allowed_transitions = ["in_review", "action_taken", "resolved", "closed", "open"]
+            next_status = st.selectbox("Target Status", options=allowed_transitions, index=0)
+            trans_reason = st.text_area("Transition Justification / Reopening Reason", placeholder="Explain why status is changing...")
+            closure_sum = st.text_area("Closure Summary (Mandatory if transitioning to CLOSED)", placeholder="Summary of resolution...")
+            changed_by = st.text_input("Updated By", value="Reliability Engineer")
+            submit_trans = st.form_submit_button("Apply Status Transition")
+            if submit_trans:
+                try:
+                    history_store.transition_case_status(
+                        evidence_store,
+                        dataset_id,
+                        case_id,
+                        new_status=next_status,
+                        reason=trans_reason,
+                        changed_by=changed_by,
+                        closure_summary=closure_sum if next_status == "closed" else None,
+                    )
+                    st.success(f"Case transitioned to `{next_status.upper()}` successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Transition error: {e}")
+
+    # 4. Status History Ledger
+    st.markdown("#### 📜 Status Change Audit Ledger")
+    status_hist = case_data.get("status_history", [])
+    if status_hist:
+        st.dataframe(
+            [
+                {
+                    "Time (UTC)": h["changed_at"][:19].replace("T", " "),
+                    "From": (h["from_status"] or "INIT").upper(),
+                    "To": h["to_status"].upper(),
+                    "Reason": h["reason"],
+                    "Changed By": h["changed_by"],
+                }
+                for h in status_hist
+            ],
+            hide_index=True,
+        )
 
 
 def render_central_hub(
