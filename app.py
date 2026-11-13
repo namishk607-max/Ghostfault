@@ -47,6 +47,11 @@ from src.models import (
 from src.indexer import SearchIndex
 from src.retriever import EvidenceRetriever
 from src.analyzer import FaultAnalysisEngine
+from src.ai_gateway import (
+    GatewayError,
+    load_gateway_config,
+    request_commentary,
+)
 from src.cross_incident import CrossIncidentComparisonEngine, generate_incident_timeline
 from src.evidence_linker import CrossIncidentEvidenceLinker
 from src.history import HistoryStoreError, InvestigationHistoryStore
@@ -972,6 +977,63 @@ def render_fault_analysis(
                 st.markdown("**Safety & Technical Limitations:**")
                 for lim in analysis_result.limitations:
                     st.markdown(f"- ⚠️ {lim}")
+
+        st.markdown("---")
+        st.markdown("#### Optional AI Commentary")
+        st.caption(
+                "AI-generated, unverified commentary is separate from deterministic analysis and is never "
+                "saved to investigation history. If enabled, only the selected incident's symptom, "
+                "maintenance action, and up to three deterministic hypothesis summaries are sent to the "
+                "configured gateway; evidence passages and dataset identifiers are not sent."
+        )
+        st.warning(
+                "The configured AI provider may process operational information. Enable this only if "
+                "sharing the selected incident summary with that provider is permitted."
+        )
+        ai_enabled = st.checkbox(
+            "Enable optional AI commentary for this session",
+            key=f"ai_commentary_enabled_{target_ds_id}",
+            value=False,
+        )
+        if ai_enabled:
+            try:
+                try:
+                    streamlit_secrets = st.secrets
+                except FileNotFoundError:
+                    streamlit_secrets = {}
+                gateway_config = load_gateway_config(
+                    True,
+                    secrets=streamlit_secrets,
+                )
+            except GatewayError as exc:
+                st.info(str(exc))
+            else:
+                run_id = st.session_state.get(run_id_key)
+                if not run_id:
+                    run_id = str(uuid.uuid4())
+                    st.session_state[run_id_key] = run_id
+                commentary_key = f"ai_commentary_{target_ds_id}_{run_id}"
+                if st.button(
+                    "Request AI-generated, unverified commentary",
+                    key=f"btn_ai_commentary_{target_ds_id}_{run_id}",
+                ):
+                    with st.spinner("Requesting separate AI commentary..."):
+                        try:
+                            commentary = request_commentary(
+                                gateway_config,
+                                incident_dict,
+                                analysis_result,
+                                target_ds_id,
+                            )
+                        except GatewayError as exc:
+                            st.error(str(exc))
+                            st.session_state.pop(commentary_key, None)
+                        else:
+                            st.session_state[commentary_key] = commentary
+                saved_commentary = st.session_state.get(commentary_key)
+                if saved_commentary:
+                    st.warning("AI-generated, unverified commentary — not evidence or a verified finding.")
+                    st.text(saved_commentary)
 
 
 def render_incident_timeline(

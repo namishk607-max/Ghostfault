@@ -204,7 +204,44 @@ python -m pip install -r requirements.txt
 python -m pytest -v
 ```
 
-### 4. Launch the Streamlit Dashboard
+### 4. Optional AI commentary setup
+
+GhostFault's evidence retrieval, analysis, verification, and investigation history work locally
+without an AI provider. AI commentary is an optional, explicitly enabled advisor and is never
+treated as evidence or saved in investigation history.
+
+Install the optional OpenAI-compatible client only if you intend to use AI commentary:
+
+```powershell
+python -m pip install -r requirements-ai.txt
+```
+
+Configure the gateway endpoint, API key, and model outside source control. For example, in
+PowerShell for the current session:
+
+```powershell
+$env:OMNIROUTE_BASE_URL = "http://localhost:20128/v1"
+$env:OMNIROUTE_API_KEY = "your-local-gateway-key"
+$env:OMNIROUTE_MODEL = "your-configured-model"
+```
+
+Alternatively, put these settings in the ignored `.streamlit/secrets.toml` file:
+
+```toml
+OMNIROUTE_BASE_URL = "http://localhost:20128/v1"
+OMNIROUTE_API_KEY = "your-local-gateway-key"
+OMNIROUTE_MODEL = "your-configured-model"
+```
+
+Environment variables take precedence over Streamlit secrets. The app does not contact the
+gateway until AI commentary is enabled in the analysis view and the request button is pressed.
+That request sends only the selected incident's symptom, maintenance action, and a bounded summary
+of up to three deterministic hypotheses; it does not send evidence passages or dataset identifiers.
+Do not enable it unless sharing that incident summary with the configured provider is permitted.
+AI responses are unverified commentary and cannot verify evidence, change evidence strength or case
+status, or alter saved investigation snapshots. M9.2 does not perform web search.
+
+### 5. Launch the Streamlit Dashboard
 ```powershell
 python -m streamlit run app.py
 ```
@@ -215,7 +252,7 @@ Open `http://localhost:8501` in your browser.
 ## Synthetic Data & Safety Disclaimer
 
 - Incident records in `data/sample/incidents.csv` are **fictional and synthetic**.
-- **No external AI APIs, cloud vector databases, or neural embeddings** are used.
+- Local-first deterministic analysis does not require external AI APIs, cloud vector databases, or neural embeddings. Optional AI commentary can be enabled separately as described above.
 - Investigative hypotheses are **preliminary technical suggestions** grounded in available documentation and require qualified human judgment and standard OEM maintenance/lockout procedures.
 
 ---
