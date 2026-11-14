@@ -55,6 +55,8 @@ from src.ai_gateway import (
 from src.cross_incident import CrossIncidentComparisonEngine, generate_incident_timeline
 from src.evidence_linker import CrossIncidentEvidenceLinker
 from src.history import HistoryStoreError, InvestigationHistoryStore
+from src.equipment import EquipmentRegistry, EquipmentRegistryError
+from src.equipment_taxonomy import EQUIPMENT_TAXONOMY
 from src.hub import (
     compute_project_summary,
     compute_dataset_registry,
@@ -84,6 +86,7 @@ from src.hub import (
     NAV_FAULT_ANALYSIS,
     NAV_CROSS_INCIDENT,
     NAV_INVESTIGATION_HISTORY,
+    NAV_EQUIPMENT,
 )
 
 
@@ -353,6 +356,12 @@ def get_investigation_history_store() -> InvestigationHistoryStore:
         allow_mig = os.environ.get("GHOSTFAULT_ALLOW_MIGRATION", "").lower() in ("1", "true", "yes")
         return InvestigationHistoryStore(Path(env_history_db), allow_migration=allow_mig)
     return InvestigationHistoryStore()
+
+
+@st.cache_resource
+def get_equipment_registry() -> EquipmentRegistry:
+    """Initialize the separate local equipment registry."""
+    return EquipmentRegistry(EvidenceStore())
 
 
 def render_evidence_ingestion(
@@ -1600,6 +1609,521 @@ def render_dataset_workspace(
             )
 
 
+def render_equipment_intelligence(
+    registry: EquipmentRegistry,
+    active_dataset: Dataset,
+    incidents_df: pd.DataFrame,
+) -> None:
+    """Render equipment records and explicitly reviewed active-dataset incident links."""
+    dataset_id = active_dataset.dataset_id
+    st.subheader("Equipment Intelligence")
+    st.caption(
+        f"Equipment records are isolated to **{active_dataset.name}** (`{dataset_id}`). "
+        "Equipment registration and incident association do not establish a verified root cause."
+    )
+    st.info(
+        "Electric motors, pumps, gearboxes, and compressors are candidate taxonomy categories, "
+        "not validated engineering standards. Legacy machine IDs are identifiers only and are "
+        "never automatically converted into equipment records or incident links."
+    )
+
+    try:
+        assets = registry.list_equipment(dataset_id)
+    except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+        st.error(f"Equipment records could not be loaded: {exc}")
+        return
+
+    equipment_tab, association_tab = st.tabs(
+        ["Equipment and components", "Incident associations"]
+    )
+
+    with equipment_tab:
+        if assets:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Equipment": asset["asset_name"],
+                            "Category": asset["category_code"],
+                            "Subtype": asset["subtype_code"] or "Not specified",
+                            "Manufacturer": asset["manufacturer"] or "Not specified",
+                            "Model": asset["model"] or "Not specified",
+                            "Asset tag": asset["asset_tag"] or "Not specified",
+                            "Classification": asset["classification_status"],
+                            "Equipment ID": asset["equipment_id"],
+                        }
+                        for asset in assets
+                    ]
+                ),
+                hide_index=True,
+            )
+        else:
+            st.info("No equipment is registered in this dataset yet.")
+
+        with st.expander("Register equipment", expanded=not assets):
+            category_labels = dict(registry.category_options())
+            category_codes = list(category_labels)
+            create_category = st.selectbox(
+                "Candidate category",
+                options=category_codes,
+                format_func=lambda value: (
+                    f"{category_labels[value]} ({EQUIPMENT_TAXONOMY[value]['status']})"
+                ),
+                key=f"equipment_create_category_{dataset_id}",
+            )
+            create_subtypes = dict(registry.subtype_options(create_category))
+            create_subtype = st.selectbox(
+                "Subtype",
+                options=[""] + list(create_subtypes),
+                format_func=lambda value: (
+                    "Not specified" if not value else create_subtypes[value]
+                ),
+                key=f"equipment_create_subtype_{dataset_id}",
+            )
+            with st.form(f"equipment_create_form_{dataset_id}", clear_on_submit=True):
+                asset_name = st.text_input("Equipment name", max_chars=200)
+                manufacturer = st.text_input("Manufacturer (optional)", max_chars=120)
+                model = st.text_input("Model (optional)", max_chars=120)
+                serial_number = st.text_input("Serial number (optional)", max_chars=120)
+                asset_tag = st.text_input("Asset tag (optional)", max_chars=120)
+                legacy_machine_id = st.text_input(
+                    "Legacy machine identifier (optional; not an equipment ID)",
+                    max_chars=120,
+                )
+                installation_date = st.text_input(
+                    "Installation date (optional, YYYY-MM-DD)", max_chars=10
+                )
+                location = st.text_input("Location (optional)", max_chars=200)
+                criticality = st.selectbox(
+                    "Criticality (optional)",
+                    options=["", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                    format_func=lambda value: value or "Not specified",
+                )
+                submitted = st.form_submit_button("Register equipment")
+            if submitted:
+                try:
+                    registry.create_equipment(
+                        dataset_id=dataset_id,
+                        asset_name=asset_name,
+                        category_code=create_category,
+                        subtype_code=create_subtype or None,
+                        manufacturer=manufacturer,
+                        model=model,
+                        serial_number=serial_number,
+                        asset_tag=asset_tag,
+                        legacy_machine_id=legacy_machine_id,
+                        installation_date=installation_date,
+                        location=location,
+                        criticality=criticality or None,
+                    )
+                except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+                    st.error(f"Equipment was not registered: {exc}")
+                else:
+                    st.success("Equipment registered with candidate/unclassified status.")
+                    st.rerun()
+
+        if assets:
+            asset_labels = {
+                asset["equipment_id"]: (
+                    f"{asset['asset_name']} — {asset['category_code']} "
+                    f"({asset['equipment_id'][:8]})"
+                )
+                for asset in assets
+            }
+            selected_equipment_id = st.selectbox(
+                "Select equipment record",
+                options=[asset["equipment_id"] for asset in assets],
+                format_func=lambda value: asset_labels[value],
+                key=f"equipment_selected_{dataset_id}",
+            )
+            selected_asset = registry.get_equipment(dataset_id, selected_equipment_id)
+            if selected_asset is not None:
+                st.markdown(
+                    f"**Classification:** {selected_asset['classification_status']} "
+                    f"— taxonomy `{selected_asset['taxonomy_version']}`"
+                )
+                st.caption(
+                    "Candidate taxonomy classifications are not technical validation. "
+                    "Unclassified records remain available without a category claim."
+                )
+                with st.form(
+                    f"equipment_edit_form_{dataset_id}_{selected_equipment_id}",
+                ):
+                    edited_name = st.text_input(
+                        "Equipment name",
+                        value=selected_asset["asset_name"],
+                        max_chars=200,
+                    )
+                    edited_manufacturer = st.text_input(
+                        "Manufacturer",
+                        value=selected_asset["manufacturer"] or "",
+                        max_chars=120,
+                    )
+                    edited_model = st.text_input(
+                        "Model",
+                        value=selected_asset["model"] or "",
+                        max_chars=120,
+                    )
+                    edited_serial = st.text_input(
+                        "Serial number",
+                        value=selected_asset["serial_number"] or "",
+                        max_chars=120,
+                    )
+                    edited_tag = st.text_input(
+                        "Asset tag",
+                        value=selected_asset["asset_tag"] or "",
+                        max_chars=120,
+                    )
+                    edited_legacy_id = st.text_input(
+                        "Legacy machine identifier",
+                        value=selected_asset["legacy_machine_id"] or "",
+                        max_chars=120,
+                    )
+                    edited_installation_date = st.text_input(
+                        "Installation date (YYYY-MM-DD)",
+                        value=selected_asset["installation_date"] or "",
+                        max_chars=10,
+                    )
+                    edited_location = st.text_input(
+                        "Location",
+                        value=selected_asset["location"] or "",
+                        max_chars=200,
+                    )
+                    criticality_options = ["", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+                    current_criticality = selected_asset["criticality"] or ""
+                    edited_criticality = st.selectbox(
+                        "Criticality",
+                        options=criticality_options,
+                        index=criticality_options.index(current_criticality),
+                        format_func=lambda value: value or "Not specified",
+                    )
+                    update_submitted = st.form_submit_button("Save equipment details")
+                if update_submitted:
+                    try:
+                        registry.update_equipment(
+                            dataset_id,
+                            selected_equipment_id,
+                            {
+                                "asset_name": edited_name,
+                                "manufacturer": edited_manufacturer,
+                                "model": edited_model,
+                                "serial_number": edited_serial,
+                                "asset_tag": edited_tag,
+                                "legacy_machine_id": edited_legacy_id,
+                                "installation_date": edited_installation_date,
+                                "location": edited_location,
+                                "criticality": edited_criticality or None,
+                            },
+                        )
+                    except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+                        st.error(f"Equipment details were not saved: {exc}")
+                    else:
+                        st.success("Equipment details updated.")
+                        st.rerun()
+
+                current_category = selected_asset["category_code"]
+                category_labels = dict(registry.category_options())
+                category_codes = list(category_labels)
+                current_category = (
+                    current_category if current_category in category_codes else "unclassified"
+                )
+                edited_category = st.selectbox(
+                    "Candidate category",
+                    options=category_codes,
+                    index=category_codes.index(current_category),
+                    format_func=lambda value: (
+                        f"{category_labels[value]} ({EQUIPMENT_TAXONOMY[value]['status']})"
+                    ),
+                    key=f"equipment_edit_category_{dataset_id}_{selected_equipment_id}",
+                )
+                edited_subtypes = dict(registry.subtype_options(edited_category))
+                subtype_values = [""] + list(edited_subtypes)
+                current_subtype = selected_asset["subtype_code"] or ""
+                subtype_index = (
+                    subtype_values.index(current_subtype)
+                    if current_subtype in subtype_values
+                    else 0
+                )
+                edited_subtype = st.selectbox(
+                    "Subtype",
+                    options=subtype_values,
+                    index=subtype_index,
+                    format_func=lambda value: (
+                        "Not specified" if not value else edited_subtypes[value]
+                    ),
+                    key=f"equipment_edit_subtype_{dataset_id}_{selected_equipment_id}",
+                )
+                if st.button(
+                    "Save category and subtype",
+                    key=f"equipment_save_classification_{dataset_id}_{selected_equipment_id}",
+                ):
+                    try:
+                        registry.update_equipment(
+                            dataset_id,
+                            selected_equipment_id,
+                            {
+                                "category_code": edited_category,
+                                "subtype_code": edited_subtype or None,
+                            },
+                        )
+                    except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+                        st.error(f"Equipment classification was not saved: {exc}")
+                    else:
+                        st.success("Candidate/unclassified equipment category updated.")
+                        st.rerun()
+
+                components = registry.list_components(dataset_id, selected_equipment_id)
+                st.markdown("#### Components")
+                if components:
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Component": component["component_name"],
+                                    "Type": component["component_code"] or "Unclassified",
+                                    "Parent component ID": component["parent_component_id"] or "",
+                                    "Classification": component["classification_status"],
+                                    "Manufacturer": component["manufacturer"] or "",
+                                    "Model": component["model"] or "",
+                                    "Serial number": component["serial_number"] or "",
+                                }
+                                for component in components
+                            ]
+                        ),
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No components have been registered for this equipment.")
+
+                component_labels = dict(
+                    registry.component_options(selected_asset["category_code"])
+                )
+                component_type_values = [""] + list(component_labels)
+                component_ids = [component["component_id"] for component in components]
+                component_names = {
+                    component["component_id"]: component["component_name"]
+                    for component in components
+                }
+                with st.form(
+                    f"equipment_component_form_{dataset_id}_{selected_equipment_id}",
+                    clear_on_submit=True,
+                ):
+                    component_name = st.text_input("Component name", max_chars=200)
+                    component_code = st.selectbox(
+                        "Candidate component type (optional)",
+                        options=component_type_values,
+                        format_func=lambda value: (
+                            "Unclassified component" if not value else component_labels[value]
+                        ),
+                    )
+                    parent_component_id = st.selectbox(
+                        "Parent component (optional)",
+                        options=[""] + component_ids,
+                        format_func=lambda value: (
+                            "No parent" if not value else component_names[value]
+                        ),
+                    )
+                    component_manufacturer = st.text_input(
+                        "Component manufacturer (optional)", max_chars=120
+                    )
+                    component_model = st.text_input("Component model (optional)", max_chars=120)
+                    component_serial = st.text_input(
+                        "Component serial number (optional)", max_chars=120
+                    )
+                    component_submitted = st.form_submit_button("Add component")
+                if component_submitted:
+                    try:
+                        registry.create_component(
+                            dataset_id,
+                            selected_equipment_id,
+                            component_name,
+                            component_code=component_code or None,
+                            parent_component_id=parent_component_id or None,
+                            manufacturer=component_manufacturer,
+                            model=component_model,
+                            serial_number=component_serial,
+                        )
+                    except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+                        st.error(f"Component was not added: {exc}")
+                    else:
+                        st.success("Component added.")
+                        st.rerun()
+
+    with association_tab:
+        if incidents_df is None or incidents_df.empty:
+            active_incidents = pd.DataFrame()
+        elif "dataset_id" in incidents_df.columns:
+            active_incidents = incidents_df[
+                incidents_df["dataset_id"].astype(str).str.strip() == dataset_id
+            ].copy()
+        elif dataset_id == DEFAULT_DATASET_ID:
+            active_incidents = incidents_df.copy()
+        else:
+            active_incidents = pd.DataFrame()
+
+        st.markdown("#### Incidents in the active dataset")
+        if active_incidents.empty:
+            st.info("No incidents are available in this dataset for explicit association.")
+        else:
+            visible_columns = [
+                column
+                for column in (
+                    "incident_id",
+                    "machine_id",
+                    "date",
+                    "symptom",
+                )
+                if column in active_incidents.columns
+            ]
+            st.dataframe(active_incidents[visible_columns], hide_index=True)
+
+        if not assets:
+            st.info("Register equipment in this dataset before creating incident associations.")
+        elif not active_incidents.empty:
+            incident_records = active_incidents.to_dict("records")
+            incident_labels = {
+                str(record["incident_id"]): (
+                    f"{record['incident_id']} — legacy machine ID "
+                    f"{record.get('machine_id') or 'not recorded'}"
+                )
+                for record in incident_records
+            }
+            equipment_labels = {
+                asset["equipment_id"]: (
+                    f"{asset['asset_name']} ({asset['category_code']}, "
+                    f"{asset['classification_status']})"
+                )
+                for asset in assets
+            }
+            with st.form(f"incident_equipment_link_form_{dataset_id}"):
+                incident_id = st.selectbox(
+                    "Select incident",
+                    options=list(incident_labels),
+                    format_func=lambda value: incident_labels[value],
+                )
+                equipment_id = st.selectbox(
+                    "Select registered equipment",
+                    options=list(equipment_labels),
+                    format_func=lambda value: equipment_labels[value],
+                )
+                association_role = st.selectbox(
+                    "Association role",
+                    options=["PRIMARY", "RELATED"],
+                )
+                association_notes = st.text_input(
+                    "Review notes (optional)", max_chars=1000
+                )
+                link_submitted = st.form_submit_button("Create pending association")
+            if link_submitted:
+                try:
+                    registry.create_incident_association(
+                        dataset_id,
+                        incident_id,
+                        equipment_id,
+                        active_incidents,
+                        role=association_role,
+                        review_notes=association_notes,
+                    )
+                except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+                    st.error(f"Incident association was not created: {exc}")
+                else:
+                    st.success("Association created with PENDING_REVIEW status.")
+                    st.rerun()
+
+        try:
+            associations = registry.list_incident_associations(dataset_id)
+            missing_incident_findings = registry.diagnose_missing_incidents(
+                dataset_id,
+                active_incidents if not active_incidents.empty else pd.DataFrame(),
+            )
+        except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+            st.error(f"Incident associations could not be loaded: {exc}")
+            associations = []
+            missing_incident_findings = []
+
+        st.markdown("#### Existing associations")
+        if associations:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Incident ID": row["incident_id"],
+                            "Equipment": row["asset_name"],
+                            "Category": row["category_code"],
+                            "Role": row["role"],
+                            "Review status": row["review_status"],
+                            "Link source": row["link_source"],
+                            "Review notes": row["review_notes"] or "",
+                        }
+                        for row in associations
+                    ]
+                ),
+                hide_index=True,
+            )
+        else:
+            st.info("No equipment associations exist in the active dataset.")
+
+        if missing_incident_findings:
+            st.warning(
+                f"{len(missing_incident_findings)} association(s) reference incidents no longer "
+                "present in this dataset. They are reported and left unchanged."
+            )
+
+        pending = [
+            row for row in associations if row["review_status"] == "PENDING_REVIEW"
+        ]
+        if pending:
+            st.markdown("#### Review pending associations")
+            for association in pending:
+                with st.container(border=True):
+                    st.write(
+                        f"Incident **{association['incident_id']}** → "
+                        f"**{association['asset_name']}** ({association['role']})"
+                    )
+                    with st.form(
+                        f"review_equipment_link_{dataset_id}_{association['association_id']}"
+                    ):
+                        reviewer = st.text_input("Reviewer", max_chars=120)
+                        review_notes = st.text_input(
+                            "Review notes", value=association["review_notes"] or "", max_chars=1000
+                        )
+                        decision = st.selectbox(
+                            "Decision",
+                            options=["REVIEWED", "REJECTED"],
+                            format_func=lambda value: (
+                                "Accept association" if value == "REVIEWED" else "Reject association"
+                            ),
+                        )
+                        review_submitted = st.form_submit_button("Save review")
+                    if review_submitted:
+                        try:
+                            registry.review_incident_association(
+                                dataset_id,
+                                association["association_id"],
+                                decision,
+                                reviewer,
+                                review_notes=review_notes,
+                            )
+                        except (EquipmentRegistryError, DatasetOwnershipError) as exc:
+                            st.error(f"Association review was not saved: {exc}")
+                        else:
+                            st.success(f"Association marked {decision}.")
+                            st.rerun()
+
+        try:
+            project_findings = registry.diagnose_unregistered_dataset_references()
+        except EquipmentRegistryError as exc:
+            st.error(f"Equipment integrity diagnostics could not be completed: {exc}")
+        else:
+            orphan_count = sum(item["record_count"] for item in project_findings)
+            if orphan_count:
+                st.warning(
+                    f"Project-wide equipment integrity found {orphan_count} record(s) "
+                    "referencing unregistered datasets. Only aggregate counts are shown here; "
+                    "records are not repaired or deleted."
+                )
+
+
 def render_investigation_history(
     history_store: InvestigationHistoryStore,
     evidence_store: EvidenceStore,
@@ -2690,6 +3214,18 @@ def main() -> None:
             ingestion_service.store,
             active_dataset,
         )
+
+    elif selected_page == NAV_EQUIPMENT:
+        try:
+            equipment_registry = get_equipment_registry()
+        except EquipmentRegistryError as exc:
+            st.error(f"Equipment registry is unavailable: {exc}")
+        else:
+            render_equipment_intelligence(
+                equipment_registry,
+                active_dataset,
+                active_incidents_df,
+            )
 
 
 if __name__ == "__main__":

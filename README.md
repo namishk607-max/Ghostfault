@@ -25,13 +25,18 @@ Ghostvault/
 │   │   │   └── datasets.json # Persistent dataset registry
 │   │   └── index/
 │   │       └── evidence_index.db # SQLite FTS5 persistent full-text search index
-│   └── history/             # [Runtime / Local only - Git ignored]
+│   ├── history/             # [Runtime / Local only - Git ignored]
 │       └── investigation_history.db # Versioned investigation snapshots and activity
+│   └── equipment/           # [Runtime / Local only - Git ignored]
+│       └── equipment_registry.db # Dataset-scoped equipment and incident associations
 ├── src/
 │   ├── __init__.py
 │   ├── data_loader.py       # Incident dataset validation, relative loading, and filtering
 │   ├── hub.py               # Project summaries, dataset state, integrity, and navigation
 │   ├── history.py           # Dataset-scoped persistent investigation history and activity
+│   ├── equipment.py         # Dataset-scoped equipment, component, and incident-link registry
+│   ├── equipment_taxonomy.py # Versioned candidate equipment and component taxonomy
+│   ├── ai_gateway.py        # Optional, isolated AI-generated commentary gateway
 │   ├── models.py            # Typed domain models (Incidents, Chunks, SearchResults, Hypotheses, Scopes)
 │   ├── extractor.py         # Isolated text extraction for TXT and PDF (pypdf)
 │   ├── storage.py           # Atomic writes, path traversal sanitization, and catalog management
@@ -55,6 +60,7 @@ Ghostvault/
     ├── test_dataset_ownership.py # Ownership validation across registry, catalog, and index
     ├── test_dataset_retrieval.py # Strict dataset-scoped evidence retrieval
     ├── test_investigation_history.py # Persistent history, activity, and dataset isolation
+    ├── test_equipment_registry.py # Equipment, component, association, and isolation tests
     └── test_m7_3_stabilization.py # Navigation, UI state, and integrity regressions
 ```
 
@@ -181,6 +187,25 @@ Ghostvault/
 - FTS5 search is constrained by both the indexed-document and evidence-chunk dataset snapshots, then checked against the catalog's authoritative document owner and provenance.
 - Dataset-scoped integrity validation blocks retrieval when relevant catalog, index, chunk, or FTS records disagree. It reports diagnostics without migrating, repairing, or rebuilding data.
 - Evidence Search displays the active dataset and its integrity status. Index statistics and maintenance actions remain explicitly project-wide.
+
+### M9.3 Equipment Intelligence
+
+- Equipment assets and components are stored in the separate local SQLite registry at
+  `data/equipment/equipment_registry.db`. It does not use or alter the evidence index or
+  investigation-history database.
+- Electric motors, pumps, gearboxes, and compressors are available as **candidate** taxonomy
+  categories. The category, subtype, and component definitions are versioned, intentionally
+  limited, and are not represented as a complete engineering standard or validated expertise.
+- Equipment and component records are scoped to the active dataset. Optional asset details include
+  manufacturer, model, serial number, installation date, location, criticality, and a legacy
+  machine identifier.
+- Components can be arranged in dataset- and equipment-scoped parent/child hierarchies. Component
+  types are category-specific where listed; unclassified components remain supported.
+- Incidents and equipment are linked only after an explicit user selection. New associations start
+  in `PENDING_REVIEW` and can be marked `REVIEWED` or `REJECTED`. Legacy `machine_id` values are
+  never treated as equipment IDs and do not create records or links automatically.
+- Incident CSV records remain unchanged. Candidate classifications, equipment records, and links
+  do not establish verified root causes. Equipment context is not sent to the optional AI gateway.
 
 ---
 

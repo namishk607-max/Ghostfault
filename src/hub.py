@@ -314,6 +314,7 @@ NAV_EVIDENCE_SEARCH = "Evidence Search"
 NAV_FAULT_ANALYSIS = "Fault Analysis"
 NAV_CROSS_INCIDENT = "Cross-Incident Analysis"
 NAV_INVESTIGATION_HISTORY = "Investigation History & Activity"
+NAV_EQUIPMENT = "Equipment Intelligence"
 
 NAVIGATION_PAGES = [
     NAV_HUB,
@@ -324,6 +325,7 @@ NAVIGATION_PAGES = [
     NAV_FAULT_ANALYSIS,
     NAV_CROSS_INCIDENT,
     NAV_INVESTIGATION_HISTORY,
+    NAV_EQUIPMENT,
 ]
 
 
