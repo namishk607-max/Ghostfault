@@ -26,6 +26,7 @@ secrets/
 data/evidence/
 data/history/
 data/equipment/
+data/knowledge/
 data/temp*/
 
 # IDE / Editor artifacts
