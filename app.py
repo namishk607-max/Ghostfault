@@ -61,6 +61,11 @@ from src.knowledge_models import KnowledgeDocument, ReliabilityTier, SourceType
 from src.knowledge_store import KnowledgeStore, KnowledgeStoreError
 from src.knowledge_ingestion import KnowledgeIngestionService, KnowledgeIngestionError
 from src.knowledge_search import KnowledgeSearchIndex, KnowledgeSearchResult, KnowledgeIndexError
+from src.knowledge_advisor import (
+    TechnicalKnowledgeAdvisor,
+    ContextualTechnicalReference,
+    EquipmentMatchLevel,
+)
 from src.hub import (
     compute_project_summary,
     compute_dataset_registry,
@@ -391,6 +396,14 @@ def get_knowledge_ingestion_service() -> KnowledgeIngestionService:
     k_store = get_knowledge_store()
     k_index = get_knowledge_search_index()
     return KnowledgeIngestionService(k_store, search_index=k_index)
+
+
+@st.cache_resource
+def get_knowledge_advisor() -> TechnicalKnowledgeAdvisor:
+    """Initialize the separate technical knowledge advisor."""
+    k_index = get_knowledge_search_index()
+    eq_reg = get_equipment_registry()
+    return TechnicalKnowledgeAdvisor(k_index, eq_reg)
 
 
 def render_evidence_ingestion(
@@ -1015,6 +1028,55 @@ def render_fault_analysis(
                 st.markdown("**Safety & Technical Limitations:**")
                 for lim in analysis_result.limitations:
                     st.markdown(f"- ⚠️ {lim}")
+
+            st.markdown("---")
+            st.markdown("#### 📚 External Technical References & Standards")
+            st.caption(
+                "Contextual technical references from OEM manuals, ISO/API engineering standards, and publications. "
+                "Retrieved based on associated equipment and deterministic hypotheses. "
+                "External references provide reference background and do NOT constitute verified incident evidence."
+            )
+
+            tech_refs_key = f"tech_refs_{target_ds_id}_{selected_incident_id}"
+            if st.button("Query Relevant Technical References", key=f"btn_tech_refs_{target_ds_id}_{selected_incident_id}"):
+                with st.spinner("Retrieving equipment-conditioned engineering references..."):
+                    try:
+                        advisor = get_knowledge_advisor()
+                        refs = advisor.retrieve_technical_references(
+                            incident_id=selected_incident_id,
+                            dataset_id=target_ds_id,
+                            analysis_result=analysis_result,
+                        )
+                        st.session_state[tech_refs_key] = refs
+                    except Exception as exc:
+                        st.error(f"Failed to retrieve technical references: {exc}")
+                        st.session_state.pop(tech_refs_key, None)
+
+            stored_refs = st.session_state.get(tech_refs_key)
+            if stored_refs is not None:
+                if not stored_refs:
+                    st.info("No matching technical references found in the knowledge base for this incident and equipment context.")
+                else:
+                    st.success(f"Retrieved **{len(stored_refs)}** external technical reference(s):")
+                    for r_idx, ref in enumerate(stored_refs, 1):
+                        with st.container(border=True):
+                            col_t1, col_t2 = st.columns([3, 1])
+                            with col_t1:
+                                st.markdown(f"**#{r_idx} — {ref.title}**")
+                                meta_parts = [f"**Publisher/Author:** {ref.publisher_author}"]
+                                if ref.section_heading:
+                                    meta_parts.append(f"**Section:** {ref.section_heading}")
+                                if ref.estimated_page:
+                                    meta_parts.append(f"**Est. Page:** {ref.estimated_page}")
+                                if ref.matched_hypothesis_title:
+                                    meta_parts.append(f"**Mechanism:** `{ref.matched_hypothesis_title}`")
+                                st.caption(" | ".join(meta_parts))
+                            with col_t2:
+                                st.badge(ref.reliability_tier.value)
+                                st.caption(f"Match: **{ref.match_level.value}** | Score: `{ref.relevance_score:.4f}`")
+
+                            st.markdown(f"> *{ref.text}*")
+                            st.caption(f"⚠️ *{ref.reference_disclaimer}*")
 
         st.markdown("---")
         st.markdown("#### Optional AI Commentary")
