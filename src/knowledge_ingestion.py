@@ -3,7 +3,7 @@
 import hashlib
 import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from src.extractor import ExtractionResult, TextExtractor
 from src.knowledge_models import KnowledgeDocument, ReliabilityTier, SourceType
@@ -28,10 +28,12 @@ class KnowledgeIngestionService:
         self,
         knowledge_store: KnowledgeStore,
         base_dir: Optional[Path] = None,
+        search_index: Optional[Any] = None,
     ) -> None:
         if not isinstance(knowledge_store, KnowledgeStore):
             raise TypeError("KnowledgeIngestionService requires a KnowledgeStore instance.")
         self.knowledge_store = knowledge_store
+        self.search_index = search_index
         if base_dir is None:
             project_root = Path(__file__).resolve().parent.parent
             self.base_dir = project_root / "data" / "knowledge"
@@ -212,6 +214,11 @@ class KnowledgeIngestionService:
                 is_proprietary_restricted=is_proprietary_restricted,
                 document_id=doc_id,
             )
+            if self.search_index is not None:
+                try:
+                    self.search_index.index_document(document)
+                except Exception:
+                    pass
             return document
         except Exception:
             # Clean up written files on database error (e.g. duplicate or invalid scope)

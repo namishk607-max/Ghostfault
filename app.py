@@ -60,6 +60,7 @@ from src.equipment_taxonomy import EQUIPMENT_TAXONOMY
 from src.knowledge_models import KnowledgeDocument, ReliabilityTier, SourceType
 from src.knowledge_store import KnowledgeStore, KnowledgeStoreError
 from src.knowledge_ingestion import KnowledgeIngestionService, KnowledgeIngestionError
+from src.knowledge_search import KnowledgeSearchIndex, KnowledgeSearchResult, KnowledgeIndexError
 from src.hub import (
     compute_project_summary,
     compute_dataset_registry,
@@ -375,9 +376,21 @@ def get_knowledge_store() -> KnowledgeStore:
 
 
 @st.cache_resource
+def get_knowledge_search_index() -> KnowledgeSearchIndex:
+    """Initialize the separate local engineering knowledge FTS5 search index."""
+    k_store = get_knowledge_store()
+    # Temporary bootstrap service without index for circular reference avoidance
+    bootstrap_service = KnowledgeIngestionService(k_store)
+    k_index = KnowledgeSearchIndex(k_store, bootstrap_service)
+    return k_index
+
+
+@st.cache_resource
 def get_knowledge_ingestion_service() -> KnowledgeIngestionService:
     """Initialize the separate engineering knowledge ingestion service."""
-    return KnowledgeIngestionService(get_knowledge_store())
+    k_store = get_knowledge_store()
+    k_index = get_knowledge_search_index()
+    return KnowledgeIngestionService(k_store, search_index=k_index)
 
 
 def render_evidence_ingestion(
@@ -2142,24 +2155,120 @@ def render_equipment_intelligence(
 
 def render_engineering_knowledge(
     ingestion_service: KnowledgeIngestionService,
+    search_index: KnowledgeSearchIndex,
     active_dataset: Optional[Dataset],
 ) -> None:
-    """Render Engineering Knowledge upload, metadata catalog, and document browser."""
+    """Render Engineering Knowledge upload, search, and document catalog browser."""
     st.subheader("📚 Engineering Technical Knowledge & Standards")
     st.caption(
-        "Upload and catalog external engineering standards, OEM manuals, and research papers. "
+        "Search, catalog, and query external engineering standards, OEM manuals, and research papers. "
         "External technical literature provides reference baseline context and is never "
         "treated as verified factory incident evidence."
     )
     st.info(
         "Supported formats: `.pdf` (selectable text; OCR not supported) and `.txt`. "
-        "All uploaded documents are stored locally and are never transmitted to external services."
+        "All uploaded documents and FTS5 search indexes are stored locally."
     )
 
     dataset_id = active_dataset.dataset_id if active_dataset else DEFAULT_DATASET_ID
     knowledge_store = ingestion_service.knowledge_store
 
-    upload_tab, library_tab = st.tabs(["Upload Document", "Knowledge Library"])
+    search_tab, upload_tab, library_tab = st.tabs(
+        ["🔍 Technical Search", "📥 Upload Document", "📖 Knowledge Library"]
+    )
+
+    with search_tab:
+        st.markdown("##### Search Technical Literature & Standards")
+        st.caption(
+            "Query indexed passages from OEM technical manuals, ISO/API standards, and engineering publications. "
+            "Passages are ranked using SQLite FTS5 BM25 scoring and restricted to the selected scope."
+        )
+
+        col_sq1, col_sq2 = st.columns([3, 1])
+        with col_sq1:
+            search_query = st.text_input(
+                "Enter technical keywords (e.g., vibration limits, bearing clearance, seal flush)",
+                key=f"k_search_input_{dataset_id}",
+            )
+        with col_sq2:
+            search_scope = st.selectbox(
+                "Search Scope",
+                options=["Active Dataset + Global", "Active Dataset Only", "Global Only"],
+                key=f"k_search_scope_{dataset_id}",
+            )
+
+        col_sf1, col_sf2, col_sf3 = st.columns([2, 2, 1])
+        with col_sf1:
+            filter_st = st.selectbox(
+                "Filter Source Type (optional)",
+                options=["All"] + [s.name for s in SourceType],
+                format_func=lambda s: s.replace("_", " ").title(),
+                key=f"k_sf_type_{dataset_id}",
+            )
+        with col_sf2:
+            filter_rt = st.selectbox(
+                "Filter Reliability Tier (optional)",
+                options=["All"] + [r.name for r in ReliabilityTier],
+                format_func=lambda r: r.replace("_", " ").title(),
+                key=f"k_sf_tier_{dataset_id}",
+            )
+        with col_sf3:
+            max_results = st.number_input("Max Results", min_value=1, max_value=50, value=10)
+
+        if st.button("Search Knowledge Base", key=f"btn_k_search_{dataset_id}", type="primary"):
+            if not search_query.strip():
+                st.warning("Please enter search terms.")
+            else:
+                st_filter = None if filter_st == "All" else SourceType[filter_st]
+                rt_filter = None if filter_rt == "All" else ReliabilityTier[filter_rt]
+
+                inc_global = search_scope == "Active Dataset + Global"
+                target_ds = None if search_scope == "Global Only" else dataset_id
+
+                matches = search_index.search(
+                    query=search_query.strip(),
+                    dataset_id=target_ds,
+                    include_global=inc_global,
+                    source_type=st_filter,
+                    reliability_tier=rt_filter,
+                    limit=int(max_results),
+                )
+
+                if not matches:
+                    st.info("No matching engineering passages found for your query.")
+                else:
+                    st.success(f"Found **{len(matches)}** relevant technical passage(s):")
+                    for idx, match in enumerate(matches, 1):
+                        with st.container(border=True):
+                            col_hdr1, col_hdr2 = st.columns([3, 1])
+                            with col_hdr1:
+                                st.markdown(f"**#{idx} — {match.title}**")
+                                subtitle_parts = [f"**Publisher/Author:** {match.publisher_author}"]
+                                if match.section_heading:
+                                    subtitle_parts.append(f"**Section:** {match.section_heading}")
+                                if match.estimated_page:
+                                    subtitle_parts.append(f"**Est. Page:** {match.estimated_page}")
+                                st.caption(" | ".join(subtitle_parts))
+                            with col_hdr2:
+                                st.badge(match.reliability_tier.value)
+                                st.caption(f"Score: `{match.score:.4f}` | Scope: `{match.dataset_id or 'GLOBAL'}`")
+
+                            st.markdown(f"> *{match.text}*")
+                            st.caption(f"⚠️ *{match.reference_disclaimer}*")
+
+        st.divider()
+        col_maint1, col_maint2 = st.columns([3, 1])
+        with col_maint1:
+            stats = search_index.get_index_stats()
+            st.caption(
+                f"Index Status: **{stats['indexed_documents']}** document(s) indexed with **{stats['total_chunks']}** searchable passages."
+            )
+        with col_maint2:
+            if st.button("Rebuild Search Index", key=f"btn_rebuild_kindex_{dataset_id}"):
+                with st.spinner("Rebuilding knowledge FTS5 index from ingested documents..."):
+                    res = search_index.rebuild_index()
+                    st.success(f"Rebuilt index: {res['indexed_documents']} docs, {res['total_chunks']} passages.")
+                    st.rerun()
 
     with upload_tab:
         uploaded_file = st.file_uploader(
@@ -3441,11 +3550,13 @@ def main() -> None:
     elif selected_page == NAV_KNOWLEDGE:
         try:
             knowledge_ingestion_service = get_knowledge_ingestion_service()
+            knowledge_search_index = get_knowledge_search_index()
         except Exception as exc:
             st.error(f"Engineering knowledge service is unavailable: {exc}")
         else:
             render_engineering_knowledge(
                 knowledge_ingestion_service,
+                knowledge_search_index,
                 active_dataset,
             )
 
