@@ -57,6 +57,9 @@ from src.evidence_linker import CrossIncidentEvidenceLinker
 from src.history import HistoryStoreError, InvestigationHistoryStore
 from src.equipment import EquipmentRegistry, EquipmentRegistryError
 from src.equipment_taxonomy import EQUIPMENT_TAXONOMY
+from src.knowledge_models import KnowledgeDocument, ReliabilityTier, SourceType
+from src.knowledge_store import KnowledgeStore, KnowledgeStoreError
+from src.knowledge_ingestion import KnowledgeIngestionService, KnowledgeIngestionError
 from src.hub import (
     compute_project_summary,
     compute_dataset_registry,
@@ -87,6 +90,7 @@ from src.hub import (
     NAV_CROSS_INCIDENT,
     NAV_INVESTIGATION_HISTORY,
     NAV_EQUIPMENT,
+    NAV_KNOWLEDGE,
 )
 
 
@@ -362,6 +366,18 @@ def get_investigation_history_store() -> InvestigationHistoryStore:
 def get_equipment_registry() -> EquipmentRegistry:
     """Initialize the separate local equipment registry."""
     return EquipmentRegistry(EvidenceStore())
+
+
+@st.cache_resource
+def get_knowledge_store() -> KnowledgeStore:
+    """Initialize the separate local engineering knowledge store."""
+    return KnowledgeStore(EvidenceStore())
+
+
+@st.cache_resource
+def get_knowledge_ingestion_service() -> KnowledgeIngestionService:
+    """Initialize the separate engineering knowledge ingestion service."""
+    return KnowledgeIngestionService(get_knowledge_store())
 
 
 def render_evidence_ingestion(
@@ -2124,6 +2140,201 @@ def render_equipment_intelligence(
                 )
 
 
+def render_engineering_knowledge(
+    ingestion_service: KnowledgeIngestionService,
+    active_dataset: Optional[Dataset],
+) -> None:
+    """Render Engineering Knowledge upload, metadata catalog, and document browser."""
+    st.subheader("📚 Engineering Technical Knowledge & Standards")
+    st.caption(
+        "Upload and catalog external engineering standards, OEM manuals, and research papers. "
+        "External technical literature provides reference baseline context and is never "
+        "treated as verified factory incident evidence."
+    )
+    st.info(
+        "Supported formats: `.pdf` (selectable text; OCR not supported) and `.txt`. "
+        "All uploaded documents are stored locally and are never transmitted to external services."
+    )
+
+    dataset_id = active_dataset.dataset_id if active_dataset else DEFAULT_DATASET_ID
+    knowledge_store = ingestion_service.knowledge_store
+
+    upload_tab, library_tab = st.tabs(["Upload Document", "Knowledge Library"])
+
+    with upload_tab:
+        uploaded_file = st.file_uploader(
+            "Select Technical Document (.pdf, .txt)",
+            type=["pdf", "txt"],
+            key=f"knowledge_upload_{dataset_id}",
+        )
+
+        with st.form(f"knowledge_upload_form_{dataset_id}"):
+            st.markdown("##### Document Metadata")
+            col1, col2 = st.columns(2)
+            with col1:
+                title = st.text_input("Document Title *", max_chars=300)
+                publisher_author = st.text_input("Publisher / Author *", max_chars=200)
+                source_type_name = st.selectbox(
+                    "Source Type *",
+                    options=[st_enum.name for st_enum in SourceType],
+                    format_func=lambda s: s.replace("_", " ").title(),
+                )
+                reliability_tier_name = st.selectbox(
+                    "Reliability Tier *",
+                    options=[rt_enum.name for rt_enum in ReliabilityTier],
+                    format_func=lambda r: r.replace("_", " ").title(),
+                )
+            with col2:
+                scope_choice = st.radio(
+                    "Knowledge Scope",
+                    options=["Global (Available across all datasets)", f"Dataset-Specific ({dataset_id})"],
+                    index=0,
+                )
+                publication_year_str = st.text_input("Publication Year (optional)", max_chars=4)
+                edition_revision = st.text_input("Edition / Revision (optional)", max_chars=100)
+                is_proprietary = st.checkbox("Proprietary / Restricted Access", value=False)
+
+            st.markdown("##### Equipment Applicability & Licensing (Optional)")
+            col3, col4 = st.columns(2)
+            with col3:
+                equipment_category = st.text_input("Applicable Equipment Category (optional)", max_chars=80)
+                equipment_subtype = st.text_input("Applicable Equipment Subtype (optional)", max_chars=80)
+                manufacturer = st.text_input("Manufacturer Applicability (optional)", max_chars=120)
+            with col4:
+                copyright_license = st.text_input("Copyright / License Status (optional)", max_chars=300)
+                rights_attribution = st.text_input("Rights Attribution (optional)", max_chars=300)
+
+            submit_button = st.form_submit_button("Ingest Knowledge Document")
+
+        if submit_button:
+            if not uploaded_file:
+                st.error("Please select a file to upload.")
+            elif not title.strip() or not publisher_author.strip():
+                st.error("Document Title and Publisher/Author are required.")
+            else:
+                target_scope = dataset_id if "Dataset-Specific" in scope_choice else None
+                year_val: Optional[int] = None
+                if publication_year_str.strip():
+                    try:
+                        year_val = int(publication_year_str.strip())
+                    except ValueError:
+                        st.error("Publication Year must be a valid 4-digit integer.")
+                        return
+
+                try:
+                    file_bytes = uploaded_file.getvalue()
+                    doc = ingestion_service.ingest_document(
+                        filename=uploaded_file.name,
+                        content=file_bytes,
+                        title=title.strip(),
+                        publisher_author=publisher_author.strip(),
+                        source_type=SourceType[source_type_name],
+                        reliability_tier=ReliabilityTier[reliability_tier_name],
+                        dataset_id=target_scope,
+                        publication_year=year_val,
+                        edition_revision=edition_revision.strip() or None,
+                        equipment_category=equipment_category.strip() or None,
+                        equipment_subtype=equipment_subtype.strip() or None,
+                        manufacturer=manufacturer.strip() or None,
+                        copyright_license=copyright_license.strip() or None,
+                        rights_attribution=rights_attribution.strip() or None,
+                        is_proprietary_restricted=is_proprietary,
+                    )
+                except (KnowledgeIngestionError, KnowledgeStoreError) as exc:
+                    st.error(f"Ingestion failed: {exc}")
+                except Exception as exc:
+                    st.error(f"Unexpected ingestion failure: {exc}")
+                else:
+                    st.success(
+                        f"Successfully ingested '{doc.title}' ({doc.document_id}) with hash "
+                        f"`{doc.sha256_hash[:16]}...`"
+                    )
+                    st.rerun()
+
+    with library_tab:
+        col_flt1, col_flt2 = st.columns(2)
+        with col_flt1:
+            scope_filter = st.selectbox(
+                "Filter Scope",
+                options=["Active Dataset + Global", "Active Dataset Only", "Global Only"],
+                key=f"flt_scope_{dataset_id}",
+            )
+        with col_flt2:
+            type_filter = st.selectbox(
+                "Filter Source Type",
+                options=["All"] + [st_enum.name for st_enum in SourceType],
+                key=f"flt_type_{dataset_id}",
+            )
+
+        selected_source_type = None if type_filter == "All" else SourceType[type_filter]
+        if scope_filter == "Active Dataset + Global":
+            docs = knowledge_store.list_documents(
+                dataset_id=dataset_id,
+                include_global=True,
+                source_type=selected_source_type,
+            )
+        elif scope_filter == "Active Dataset Only":
+            docs = knowledge_store.list_documents(
+                dataset_id=dataset_id,
+                include_global=False,
+                source_type=selected_source_type,
+            )
+        else:
+            docs = knowledge_store.list_documents(
+                dataset_id=None,
+                source_type=selected_source_type,
+            )
+
+        if not docs:
+            st.info("No engineering documents found for the selected scope.")
+        else:
+            st.write(f"Showing **{len(docs)}** technical document(s):")
+            doc_data = []
+            for d in docs:
+                doc_data.append(
+                    {
+                        "Document ID": d.document_id,
+                        "Title": d.title,
+                        "Publisher/Author": d.publisher_author,
+                        "Type": d.source_type.value,
+                        "Reliability": d.reliability_tier.value,
+                        "Scope": d.dataset_id or "GLOBAL",
+                        "Year": d.publication_year or "—",
+                        "Category": d.equipment_category or "—",
+                        "SHA-256": d.sha256_hash[:12] + "..." if d.sha256_hash else "—",
+                    }
+                )
+            st.dataframe(pd.DataFrame(doc_data), hide_index=True)
+
+            selected_doc_id = st.selectbox(
+                "View Document Details / Extracted Text",
+                options=[d.document_id for d in docs],
+                format_func=lambda did: f"{did} - {next((x.title for x in docs if x.document_id == did), '')}",
+                key=f"sel_know_doc_{dataset_id}",
+            )
+            if selected_doc_id:
+                selected_doc = knowledge_store.get_document(selected_doc_id)
+                if selected_doc:
+                    with st.expander("Document Metadata & Text Preview", expanded=True):
+                        st.markdown(f"**Title:** {selected_doc.title}")
+                        st.markdown(f"**Author / Publisher:** {selected_doc.publisher_author}")
+                        st.markdown(f"**Authority Tier:** `{selected_doc.reliability_tier.value}`")
+                        st.markdown(f"**Full SHA-256:** `{selected_doc.sha256_hash}`")
+                        if selected_doc.copyright_license:
+                            st.caption(f"License: {selected_doc.copyright_license}")
+
+                        extracted_text = ingestion_service.get_extracted_text(selected_doc.document_id)
+                        if extracted_text:
+                            st.text_area(
+                                "Extracted Text Content (first 2,000 characters)",
+                                value=extracted_text[:2000] + ("..." if len(extracted_text) > 2000 else ""),
+                                height=200,
+                                disabled=True,
+                            )
+                        else:
+                            st.info("No extracted text file found on disk.")
+
+
 def render_investigation_history(
     history_store: InvestigationHistoryStore,
     evidence_store: EvidenceStore,
@@ -3225,6 +3436,17 @@ def main() -> None:
                 equipment_registry,
                 active_dataset,
                 active_incidents_df,
+            )
+
+    elif selected_page == NAV_KNOWLEDGE:
+        try:
+            knowledge_ingestion_service = get_knowledge_ingestion_service()
+        except Exception as exc:
+            st.error(f"Engineering knowledge service is unavailable: {exc}")
+        else:
+            render_engineering_knowledge(
+                knowledge_ingestion_service,
+                active_dataset,
             )
 
 

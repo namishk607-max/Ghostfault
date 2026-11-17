@@ -42,6 +42,7 @@ from src.hub import (
     NAV_CROSS_INCIDENT,
     NAV_INVESTIGATION_HISTORY,
     NAV_EQUIPMENT,
+    NAV_KNOWLEDGE,
 )
 from src.data_loader import load_incidents_data, DatasetLoadError
 
@@ -361,6 +362,7 @@ class TestNavigationConstants:
         assert NAV_CROSS_INCIDENT in NAVIGATION_PAGES
         assert NAV_INVESTIGATION_HISTORY in NAVIGATION_PAGES
         assert NAV_EQUIPMENT in NAVIGATION_PAGES
+        assert NAV_KNOWLEDGE in NAVIGATION_PAGES
 
     def test_hub_is_first_page(self):
         assert NAVIGATION_PAGES[0] == NAV_HUB

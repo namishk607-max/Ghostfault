@@ -46,6 +46,7 @@ from src.hub import (
     NAV_CROSS_INCIDENT,
     NAV_INVESTIGATION_HISTORY,
     NAV_EQUIPMENT,
+    NAV_KNOWLEDGE,
     NAVIGATION_PAGES,
     SESSION_KEY_ACTIVE_DATASET,
     SESSION_KEY_NAV,
@@ -538,5 +539,6 @@ class TestWorkspaceNavigationConstants:
         assert NAV_CROSS_INCIDENT in NAVIGATION_PAGES
         assert NAV_INVESTIGATION_HISTORY in NAVIGATION_PAGES
         assert NAV_EQUIPMENT in NAVIGATION_PAGES
-        assert len(NAVIGATION_PAGES) == 9
+        assert NAV_KNOWLEDGE in NAVIGATION_PAGES
+        assert len(NAVIGATION_PAGES) == 10
         assert len(NAVIGATION_PAGES) == len(set(NAVIGATION_PAGES))
